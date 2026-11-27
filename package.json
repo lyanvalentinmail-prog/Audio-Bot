@@ -1,20 +1,26 @@
 {
   "name": "audio-bot",
   "version": "1.0.0",
-  "description": "Bot de WhatsApp para Termux con Baileys (Pairing Code) que convierte videos en stickers con audio (.s2)",
+  "description": "Bot de WhatsApp con panel TUI interactivo para Termux (QR / Pairing Code) que convierte videos y TikToks en stickers con audio (.s2)",
   "type": "module",
-  "main": "index.js",
+  "main": "launcher.js",
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
-    "start": "node index.js",
+    "start": "node launcher.js",
+    "bot": "node index.js",
+    "code": "node index.js --code",
+    "qr": "node index.js --qr",
+    "reset": "node launcher.js --wipe-all",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@hapi/boom": "^9.1.3",
     "@whiskeysockets/baileys": "7.0.0-rc14",
+    "chalk": "^5.6.2",
     "pino": "^9.6.0",
-    "protobufjs": "^7.5.4"
+    "protobufjs": "^7.5.4",
+    "qrcode": "^1.5.4"
   }
 }

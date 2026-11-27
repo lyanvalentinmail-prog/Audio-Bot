@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { createCipheriv, createHash, createHmac, randomBytes } from 'node:crypto';
 import { getMediaKeys, proto } from '@whiskeysockets/baileys';
 
@@ -7,6 +10,8 @@ import { config } from '../src/config.js';
 import { buildStickerExif, injectWebpExif, inspectWebp, readWebpExif } from '../src/exif.js';
 import { buildVideoFilter, parseCropdetectOutput, waveformFromPcm } from '../src/media.js';
 import { downloadTikTokVideoBuffer, extractTikTokUrl } from '../src/tiktok.js';
+import { evaluateSenderAccess, loadSettings, saveSettings } from '../src/settings.js';
+import { fit as tuiFit, pad as tuiPad, width as tuiWidth } from '../src/panel/tui.js';
 import {
   createAudioStreamingSidecar,
   formatWaveformBars,
@@ -414,4 +419,95 @@ test('TikTok: extrae enlaces válidos y descarga el MP4 sin marca de agua median
   assert.equal(result.provider, 'tikwm-post');
   assert.equal(result.author, 'lyan');
   assert.ok(calls.some((u) => u.includes('tikwm.com/api')));
+});
+
+test('Ajustes y TUI: modo "Solo el dueño" y números "Excluidos" funcionan en caliente', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'audiobot-settings-'));
+  const settingsFile = path.join(tmpDir, 'settings.json');
+
+  try {
+    // Valores iniciales: público, sin excluidos
+    const initial = loadSettings(settingsFile);
+    assert.equal(initial.ownerOnly, false);
+    assert.deepEqual(initial.excludedNumbers, []);
+    assert.equal(initial.stickerPack, 'Made by');
+    assert.equal(initial.stickerAuthor, '@Lyan');
+
+    // Añadir números excluidos y dueños
+    const saved = saveSettings(
+      {
+        ownerOnly: false,
+        owners: ['+598 99 111 222'],
+        excludedNumbers: ['+598 99 777 888', '5215512345678@s.whatsapp.net'],
+      },
+      settingsFile
+    );
+
+    assert.deepEqual(saved.owners, ['59899111222']);
+    assert.deepEqual(saved.excludedNumbers, ['59899777888', '5215512345678']);
+
+    // Un número excluido NO puede usar el bot
+    const blockedCheck = evaluateSenderAccess({
+      senderCandidates: ['59899777888@s.whatsapp.net'],
+      fromMe: false,
+      botNumber: '59899000000',
+      settings: saved,
+    });
+    assert.equal(blockedCheck.allowed, false);
+    assert.equal(blockedCheck.reason, 'excluded');
+
+    // También detecta variante regional mexicana (52 vs 521)
+    const mexBlocked = evaluateSenderAccess({
+      senderCandidates: ['525512345678@s.whatsapp.net'],
+      fromMe: false,
+      botNumber: '59899000000',
+      settings: saved,
+    });
+    assert.equal(mexBlocked.allowed, false);
+    assert.equal(mexBlocked.reason, 'excluded');
+
+    // Un usuario normal no excluido sí puede usarlo cuando Solo el dueño = false
+    const regularUser = evaluateSenderAccess({
+      senderCandidates: ['59899333444@s.whatsapp.net'],
+      fromMe: false,
+      botNumber: '59899000000',
+      settings: saved,
+    });
+    assert.equal(regularUser.allowed, true);
+
+    // Al activar "Solo el dueño", bloquea al usuario normal pero permite al dueño y al propio bot
+    const ownerOnlySettings = saveSettings({ ownerOnly: true }, settingsFile);
+    const blockedByOwnerMode = evaluateSenderAccess({
+      senderCandidates: ['59899333444@s.whatsapp.net'],
+      fromMe: false,
+      botNumber: '59899000000',
+      settings: ownerOnlySettings,
+    });
+    assert.equal(blockedByOwnerMode.allowed, false);
+    assert.equal(blockedByOwnerMode.reason, 'owner_only');
+
+    const ownerAllowed = evaluateSenderAccess({
+      senderCandidates: ['59899111222@s.whatsapp.net'],
+      fromMe: false,
+      botNumber: '59899000000',
+      settings: ownerOnlySettings,
+    });
+    assert.equal(ownerAllowed.allowed, true);
+    assert.equal(ownerAllowed.isOwner, true);
+
+    const selfAllowed = evaluateSenderAccess({
+      senderCandidates: ['99999999@lid'],
+      fromMe: true,
+      botNumber: '59899000000',
+      settings: ownerOnlySettings,
+    });
+    assert.equal(selfAllowed.allowed, true);
+
+    // Utilidades de ancho/recorte ANSI del panel TUI
+    assert.equal(tuiWidth('\u001b[32mAjustes\u001b[0m'), 7);
+    assert.equal(tuiWidth(tuiPad('Ajustes', 12)), 12);
+    assert.equal(tuiWidth(tuiFit('Ajustes del panel', 7)), 7);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
 });
