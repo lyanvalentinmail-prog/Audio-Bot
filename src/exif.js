@@ -16,8 +16,8 @@ const VP8X_ANIM_FLAG = 0x02;
  * Construye el payload EXIF con metadatos de paquete y autor compatible con WhatsApp.
  */
 export function buildStickerExif({
-  pack = 'Audio-Bot',
-  author = 'WhatsApp Audio Sticker',
+  pack = 'Made by',
+  author = '@Lyan',
   packId = randomUUID(),
   emojis = ['🔊'],
 } = {}) {
@@ -74,6 +74,7 @@ export function inspectWebp(webpBuf) {
   let animated = false;
   let frames = 0;
   let durationMs = 0;
+  let firstFrameLength = null;
 
   while (offset + 8 <= webpBuf.length) {
     const fourcc = webpBuf.toString('ascii', offset, offset + 4);
@@ -82,6 +83,7 @@ export function inspectWebp(webpBuf) {
     if (body + size > webpBuf.length) {
       throw new Error(`Chunk WebP truncado ("${fourcc}") en offset ${offset}.`);
     }
+    const nextOffset = body + size + (size % 2);
 
     if (fourcc === 'VP8X') {
       if (size < 10) throw new Error('Chunk VP8X malformado.');
@@ -90,6 +92,9 @@ export function inspectWebp(webpBuf) {
       height = webpBuf.readUIntLE(body + 7, 3) + 1;
     } else if (fourcc === 'ANMF') {
       frames++;
+      if (firstFrameLength === null) {
+        firstFrameLength = nextOffset;
+      }
       if (size >= 15) {
         durationMs += webpBuf.readUIntLE(body + 12, 3);
       }
@@ -105,11 +110,11 @@ export function inspectWebp(webpBuf) {
       frames = 1;
     }
 
-    offset = body + size + (size % 2);
+    offset = nextOffset;
   }
 
   if (!animated && frames === 0) frames = 1;
-  return { width, height, animated, frames, durationMs };
+  return { width, height, animated, frames, durationMs, firstFrameLength };
 }
 
 /**

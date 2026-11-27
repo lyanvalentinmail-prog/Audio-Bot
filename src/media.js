@@ -147,7 +147,7 @@ export async function videoToAnimatedWebp(inputPath, outputPath, options = {}) {
       ...trimArgs,
       '-vf', vf,
       '-loop', '0',
-      '-c:v', 'libwebp_anim',
+      '-c:v', 'libwebp',
       '-lossless', '0',
       '-q:v', String(quality),
       '-compression_level', '4',
@@ -169,6 +169,7 @@ export async function videoToAnimatedWebp(inputPath, outputPath, options = {}) {
         width: info.width || 512,
         height: info.height || 512,
         durationMs: info.durationMs,
+        firstFrameLength: info.firstFrameLength,
         animated: info.animated || info.frames > 1,
         quality,
         fps,
@@ -182,45 +183,106 @@ export async function videoToAnimatedWebp(inputPath, outputPath, options = {}) {
 }
 
 /**
- * Extrae la pista de audio del video en formato Ogg/Opus mono 48 kHz compatible
- * con el reproductor nativo de Stickers con Audio de WhatsApp.
+ * Calcula una forma de onda visual de 64 barras (0..100) a partir de muestras PCM s16le mono.
+ * WhatsApp utiliza estas 64 barras para mostrar el indicador/onda de sonido del sticker y en notas de voz.
+ */
+export function waveformFromPcm(pcmBuf, bars = 64) {
+  const buf = Buffer.isBuffer(pcmBuf) ? pcmBuf : Buffer.from(pcmBuf || []);
+  const totalSamples = Math.floor(buf.length / 2);
+  if (totalSamples === 0) {
+    return new Uint8Array(bars);
+  }
+
+  const rmsLevels = new Float64Array(bars);
+  let peak = 0;
+
+  for (let bar = 0; bar < bars; bar++) {
+    const start = Math.floor((bar * totalSamples) / bars);
+    const end = Math.max(start + 1, Math.floor(((bar + 1) * totalSamples) / bars));
+    let sumSq = 0;
+    let count = 0;
+    for (let i = start; i < Math.min(end, totalSamples); i++) {
+      const sample = buf.readInt16LE(i * 2);
+      sumSq += sample * sample;
+      count++;
+    }
+    const rms = count > 0 ? Math.sqrt(sumSq / count) : 0;
+    rmsLevels[bar] = rms;
+    if (rms > peak) peak = rms;
+  }
+
+  const waveform = new Uint8Array(bars);
+  if (peak > 0) {
+    for (let i = 0; i < bars; i++) {
+      waveform[i] = Math.max(0, Math.min(100, Math.round((rmsLevels[i] / peak) * 100)));
+    }
+  }
+  return waveform;
+}
+
+/**
+ * Extrae la pista de audio del video en formato Ogg/Opus mono 48 kHz + su forma de onda (waveform)
+ * de 64 barras compatible con el indicador visual y reproductor nativo de Stickers con Audio de WhatsApp.
  */
 export async function videoToStickerOpus(inputPath, outputPath, options = {}) {
   const { maxSeconds = 10, ffmpegBin = 'ffmpeg' } = options;
+  const pcmPath = `${outputPath}.pcm`;
 
   // Dejar el audio apenas ~0.05s más corto que el tope absorbe el padding final de Opus
   const effectiveMax = maxSeconds > 0.2 ? Math.max(0.2, maxSeconds - 0.05) : maxSeconds;
   const trimArgs = effectiveMax > 0 ? ['-t', effectiveMax.toFixed(3)] : [];
 
-  await runProcess(ffmpegBin, [
-    '-y',
-    '-v', 'error',
-    '-i', inputPath,
-    ...trimArgs,
-    '-vn',
-    '-sn',
-    '-dn',
-    '-ac', '1',
-    '-ar', '48000',
-    '-af', 'afade=t=in:st=0:d=0.02',
-    '-c:a', 'libopus',
-    '-b:a', '48k',
-    '-vbr', 'on',
-    '-application', 'audio',
-    '-map_metadata', '-1',
-    '-f', 'ogg',
-    outputPath,
-  ]);
+  try {
+    await runProcess(ffmpegBin, [
+      '-y',
+      '-v', 'error',
+      '-i', inputPath,
+      // Salida 1: Ogg/Opus mono 48 kHz
+      ...trimArgs,
+      '-map', '0:a:0',
+      '-vn',
+      '-sn',
+      '-dn',
+      '-ac', '1',
+      '-ar', '48000',
+      '-af', 'aresample=48000:first_pts=0,afade=t=in:st=0:d=0.02',
+      '-c:a', 'libopus',
+      '-b:a', '48k',
+      '-vbr', 'on',
+      '-application', 'audio',
+      '-avoid_negative_ts', 'make_zero',
+      '-map_metadata', '-1',
+      '-f', 'ogg',
+      outputPath,
+      // Salida 2: PCM 8 kHz s16le para calcular las 64 barras del waveform visual
+      ...trimArgs,
+      '-map', '0:a:0',
+      '-vn',
+      '-ac', '1',
+      '-ar', '8000',
+      '-c:a', 'pcm_s16le',
+      '-f', 's16le',
+      pcmPath,
+    ]);
 
-  const oggBuf = await fs.readFile(outputPath);
-  if (!oggBuf.length) {
-    throw new Error('La pista de audio generada está vacía.');
+    const [oggBuf, pcmBuf] = await Promise.all([
+      fs.readFile(outputPath),
+      fs.readFile(pcmPath).catch(() => Buffer.alloc(0)),
+    ]);
+
+    if (!oggBuf.length) {
+      throw new Error('La pista de audio generada está vacía.');
+    }
+
+    const waveform = waveformFromPcm(pcmBuf, 64);
+    return { audioBuffer: oggBuf, waveform };
+  } finally {
+    await fs.unlink(pcmPath).catch(() => {});
   }
-  return oggBuf;
 }
 
 /**
- * Pipeline completo: convierte un Buffer de video en WebP animado + pista Ogg/Opus.
+ * Pipeline completo: convierte un Buffer de video en WebP animado + pista Ogg/Opus + waveform.
  */
 export async function convertVideoBufferToSoundSticker(videoBuffer, options = {}) {
   const {
@@ -252,7 +314,7 @@ export async function convertVideoBufferToSoundSticker(videoBuffer, options = {}
         ? Math.min(probe.duration, maxSeconds > 0 ? maxSeconds : probe.duration)
         : maxSeconds;
 
-    const webpPromise = videoToAnimatedWebp(inFile, webpFile, {
+    const webpResult = await videoToAnimatedWebp(inFile, webpFile, {
       maxSeconds,
       maxBytes: maxWebpBytes,
       exifPayload,
@@ -260,11 +322,20 @@ export async function convertVideoBufferToSoundSticker(videoBuffer, options = {}
       ffmpegBin,
     });
 
-    const audioPromise = probe.hasAudio
-      ? videoToStickerOpus(inFile, oggFile, { maxSeconds: clipDuration, ffmpegBin }).catch(() => null)
-      : Promise.resolve(null);
+    const targetAudioSeconds =
+      webpResult.durationMs > 0
+        ? Math.min(maxSeconds > 0 ? maxSeconds : webpResult.durationMs / 1000, webpResult.durationMs / 1000)
+        : clipDuration;
 
-    const [webpResult, audioBuffer] = await Promise.all([webpPromise, audioPromise]);
+    const audioResult = probe.hasAudio
+      ? await videoToStickerOpus(inFile, oggFile, {
+          maxSeconds: targetAudioSeconds,
+          ffmpegBin,
+        }).catch(() => null)
+      : null;
+
+    const audioBuffer = audioResult?.audioBuffer || null;
+    const waveform = audioResult?.waveform || null;
 
     const durationMs =
       webpResult.durationMs > 0
@@ -274,8 +345,10 @@ export async function convertVideoBufferToSoundSticker(videoBuffer, options = {}
     return {
       webpBuffer: webpResult.buffer,
       audioBuffer,
+      waveform,
       hasAudio: Boolean(audioBuffer && audioBuffer.length > 0),
       durationMs,
+      firstFrameLength: webpResult.firstFrameLength,
       width: webpResult.width,
       height: webpResult.height,
       animated: webpResult.animated,

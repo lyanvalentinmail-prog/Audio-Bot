@@ -41,8 +41,9 @@ loadDotEnv();
 export const config = {
   phoneNumber: (process.env.PHONE_NUMBER || '').replace(/\D/g, ''),
   command: (process.env.COMMAND || '.s2').trim().toLowerCase(),
-  stickerPack: process.env.STICKER_PACK || 'Audio-Bot',
-  stickerAuthor: process.env.STICKER_AUTHOR || 'WhatsApp Audio Sticker',
+  audioCommand: (process.env.AUDIO_COMMAND || '.audio').trim().toLowerCase(),
+  stickerPack: process.env.STICKER_PACK || 'Made by',
+  stickerAuthor: process.env.STICKER_AUTHOR || '@Lyan',
   maxSeconds: parseNumber(process.env.MAX_SECONDS, 10),
   maxWebpBytes: parseNumber(process.env.MAX_WEBP_BYTES, 900_000),
   allowSelf: parseBool(process.env.ALLOW_SELF, true),
