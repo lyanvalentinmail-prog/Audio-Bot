@@ -7,11 +7,14 @@ Bot ligero en **Node.js** pensado para ejecutarse directamente en **Termux (Andr
 ## ✨ Características
 
 - 🔗 **Vinculación por Pairing Code**: solicita tu número con código de país en consola (o desde `.env`) y genera el código de 8 dígitos para vincular en el mismo celular.
-- 🎬 **Comando `.s2`**: convierte videos cortos en **stickers animados con sonido** usando la estructura Protobuf nativa de WhatsApp (`Message.audioStickerMessage` campo `134` + `StickerMessage.audioMessage` campo `26` + `streamingSidecar`).
-- 📱 **100 % compatible con Termux**: sin dependencias nativas en C++/Python (`sharp`, `canvas` o `webpmux`); inyección de metadatos EXIF en JavaScript puro + `ffmpeg`.
-- 📐 **Modos de encuadre**:
+- 🎬 **Comando `.s2`**: convierte videos cortos en **stickers animados con sonido visible** usando el formato nativo oficial de WhatsApp (`Message.stickerMessage` + `StickerMessage.audioMessage` campo `26`, `waveform` de 64 barras, `streamingSidecar`, `firstFrameLength` y `emojis: ["🔊"]`).
+- 🔊 **Ver y extraer el sonido del sticker (`.audio` / `.sonido`)**: responde a cualquier sticker con audio con `.audio` o `.sonido` (o incluso `.s2`) para ver su onda gráfica de sonido, duración, descripción/autor y recibir su pista de audio reproducible en el chat.
+- 🏷️ **Metadatos configurados por defecto**: descripción del paquete **`Made by`** y autor **`@Lyan`**.
+- 📱 **100 % compatible con Termux**: sin dependencias nativas en C++/Python (`sharp`, `canvas` o `webpmux`); inyección y lectura de metadatos EXIF en JavaScript puro + `ffmpeg`.
+- 📐 **Modos de encuadre y vista previa**:
   - `.s2` → recorte cuadrado centrado `512×512` (por defecto).
   - `.s2 full` → mantiene el encuadre completo con bordes transparentes.
+  - `.s2 ver` → envía el sticker con sonido y además adjunta la nota de audio con su onda visible.
 - 🔄 **Cola secuencial**: procesa un video a la vez para no saturar CPU ni RAM en dispositivos móviles.
 
 ---
@@ -54,16 +57,18 @@ La sesión quedará guardada en `./auth_info` para reconectarse automáticamente
 
 ---
 
-## 💬 Uso del comando `.s2`
+## 💬 Comandos disponibles
 
 | Acción | Cómo usarlo |
 | --- | --- |
 | **Enviar video directo** | Adjunta un video y escribe **`.s2`** en el comentario (caption). |
 | **Responder a un video** | Responde (*reply*) a cualquier video del chat escribiendo **`.s2`**. |
 | **Sin recortar bordes** | Usa **`.s2 full`** (o `.s2 completo`) para conservar todo el video con márgenes transparentes. |
+| **Enviar con nota de audio visible** | Usa **`.s2 ver`** para recibir el sticker con sonido + su nota de audio con onda aparte. |
+| **Ver el sonido de un sticker** | Responde a cualquier sticker con **`.audio`**, **`.sonido`** o **`.s2`** para ver su onda, duración, descripción/autor y escuchar su audio. |
 
+- En WhatsApp verás el icono **🔊** sobre el sticker para reproducir su sonido directamente al tocarlo.
 - Si el video no tiene pista de audio, el bot enviará igualmente el sticker animado WebP.
-- Por defecto recorta videos largos a los primeros `10` segundos y ajusta calidad/FPS automáticamente para no superar el límite de tamaño de WhatsApp.
 
 ---
 
@@ -78,12 +83,13 @@ cp .env.example .env
 | Variable | Por defecto | Descripción |
 | --- | --- | --- |
 | `PHONE_NUMBER` | *(vacío)* | Número con código de país para no pedirlo por consola |
-| `COMMAND` | `.s2` | Comando disparador |
-| `STICKER_PACK` | `Audio-Bot` | Nombre del paquete mostrado al tocar el sticker |
-| `STICKER_AUTHOR` | `WhatsApp Audio Sticker` | Autor del paquete de stickers |
+| `COMMAND` | `.s2` | Comando para crear stickers con audio |
+| `AUDIO_COMMAND` | `.audio` | Comando para ver/extraer el sonido de un sticker |
+| `STICKER_PACK` | `Made by` | Descripción / nombre del paquete mostrado al tocar el sticker |
+| `STICKER_AUTHOR` | `@Lyan` | Autor del paquete de stickers |
 | `MAX_SECONDS` | `10` | Duración máxima del sticker/audio en segundos |
 | `MAX_WEBP_BYTES` | `900000` | Peso máximo del archivo `.webp` animado |
-| `ALLOW_SELF` | `true` | Permite usar `.s2` desde el propio número vinculado |
+| `ALLOW_SELF` | `true` | Permite usar comandos desde el propio número vinculado |
 
 ---
 

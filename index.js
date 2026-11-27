@@ -142,7 +142,8 @@ async function startBot() {
     if (connection === 'open') {
       const userId = sock.user?.id || 'desconocido';
       console.log(`\n✅ Conectado a WhatsApp como: ${userId}`);
-      console.log(`🎬 Comando activo: ${config.command} (convierte videos en stickers con audio)\n`);
+      console.log(`🎬 Comando crear sticker con audio: ${config.command} (pack: "${config.stickerPack}" | autor: "${config.stickerAuthor}")`);
+      console.log(`🔊 Comando ver sonido del sticker: ${config.audioCommand} / .sonido\n`);
     }
 
     if (connection === 'close') {
@@ -181,7 +182,7 @@ async function startBot() {
       const dedupeKey = `${m.key.remoteJid}:${m.key.id}`;
       if (processedIds.has(dedupeKey)) continue;
 
-      const parsed = parseCommandRequest(m.message, config.command);
+      const parsed = parseCommandRequest(m.message, config.command, config.audioCommand);
       if (!parsed) continue;
 
       processedIds.add(dedupeKey);

@@ -1,14 +1,21 @@
 import { downloadContentFromMessage } from '@whiskeysockets/baileys';
-import { buildStickerExif } from './exif.js';
+import { buildStickerExif, readWebpExif } from './exif.js';
 import { convertVideoBufferToSoundSticker } from './media.js';
-import { sendSoundSticker } from './soundSticker.js';
+import {
+  downloadSoundFromSticker,
+  formatWaveformBars,
+  getEmbeddedStickerAudio,
+  sendSoundSticker,
+} from './soundSticker.js';
+
+const INSPECT_ALIASES = new Set(['.audio', '.sonido', '.veraudio']);
 
 /**
- * Desenvuelve envoltorios comunes de WhatsApp (mensajes temporales, ver una vez, documentos con leyenda, etc.)
+ * Desenvuelve envoltorios comunes de WhatsApp (mensajes temporales, ver una vez, documentos con leyenda, campo 134, etc.)
  */
 export function unwrapMessage(message) {
   let current = message;
-  for (let i = 0; i < 6 && current; i++) {
+  for (let i = 0; i < 7 && current; i++) {
     if (current.ephemeralMessage?.message) {
       current = current.ephemeralMessage.message;
     } else if (current.viewOnceMessage?.message) {
@@ -19,6 +26,8 @@ export function unwrapMessage(message) {
       current = current.viewOnceMessageV2Extension.message;
     } else if (current.documentWithCaptionMessage?.message) {
       current = current.documentWithCaptionMessage.message;
+    } else if (current.audioStickerMessage?.message) {
+      current = current.audioStickerMessage.message;
     } else if (current.editedMessage?.message?.protocolMessage?.editedMessage) {
       current = current.editedMessage.message.protocolMessage.editedMessage;
     } else {
@@ -39,10 +48,17 @@ function isVideoDocument(docMsg) {
 }
 
 /**
- * Extrae el texto del mensaje y comprueba si invoca el comando `.s2`
- * (admite modificadores opcionales como `.s2 full` / `.s2 completo` para no recortar bordes).
+ * Extrae el texto del mensaje y comprueba si invoca:
+ * - `.s2` (crear sticker con audio desde video, o ver el sonido si responde a un sticker)
+ *   - `.s2 full` / `.s2 completo` para no recortar bordes
+ *   - `.s2 ver` / `.s2 audio` para además adjuntar vista previa reproducible del sonido
+ * - `.audio` / `.sonido` / `.veraudio` (ver la onda de sonido, metadatos y escuchar el audio de un sticker)
  */
-export function parseCommandRequest(rawMessage, commandTrigger = '.s2') {
+export function parseCommandRequest(
+  rawMessage,
+  commandTrigger = '.s2',
+  audioCommandTrigger = '.audio'
+) {
   const msg = unwrapMessage(rawMessage);
   if (!msg) return null;
 
@@ -58,20 +74,53 @@ export function parseCommandRequest(rawMessage, commandTrigger = '.s2') {
 
   const parts = rawText.split(/\s+/);
   const cmd = parts[0].toLowerCase();
-  if (cmd !== commandTrigger.toLowerCase()) {
+  const mainTrigger = commandTrigger.toLowerCase();
+  const inspectTriggers = new Set([
+    ...INSPECT_ALIASES,
+    (audioCommandTrigger || '.audio').toLowerCase(),
+  ]);
+
+  const isMainCmd = cmd === mainTrigger;
+  const isInspectCmd = inspectTriggers.has(cmd);
+
+  if (!isMainCmd && !isInspectCmd) {
     return null;
   }
 
   const argsText = parts.slice(1).join(' ').toLowerCase();
   const fit = /\b(full|completo|entero|contain)\b/.test(argsText) ? 'contain' : 'crop';
+  const showSoundPreview = /\b(ver|audio|sonido|onda)\b/.test(argsText);
+
+  const contextInfo =
+    msg.extendedTextMessage?.contextInfo ||
+    msg.videoMessage?.contextInfo ||
+    msg.documentMessage?.contextInfo ||
+    msg.stickerMessage?.contextInfo;
+
+  const quoted = unwrapMessage(contextInfo?.quotedMessage);
+  const quotedSticker = quoted?.stickerMessage || null;
+
+  // Comando dedicado a ver/extraer el sonido de un sticker (.audio / .sonido / .veraudio)
+  if (isInspectCmd) {
+    return {
+      hasCommand: true,
+      action: 'inspect_sound',
+      mediaNode: quotedSticker || msg.stickerMessage || null,
+      mediaKind: quotedSticker || msg.stickerMessage ? 'sticker' : null,
+      fit,
+      showSoundPreview: true,
+    };
+  }
 
   // 1) Video adjunto directamente en el mismo mensaje con caption `.s2`
   if (msg.videoMessage) {
     return {
       hasCommand: true,
+      action: 'create_sticker',
       mediaNode: msg.videoMessage,
       mediaKind: 'video',
       fit,
+      showSoundPreview,
     };
   }
 
@@ -79,42 +128,56 @@ export function parseCommandRequest(rawMessage, commandTrigger = '.s2') {
   if (isVideoDocument(msg.documentMessage)) {
     return {
       hasCommand: true,
+      action: 'create_sticker',
       mediaNode: msg.documentMessage,
       mediaKind: 'document',
       fit,
+      showSoundPreview,
     };
   }
 
   // 3) Respuesta (reply) a un mensaje previo que contiene un video o documento de video
-  const contextInfo =
-    msg.extendedTextMessage?.contextInfo ||
-    msg.videoMessage?.contextInfo ||
-    msg.documentMessage?.contextInfo;
-
-  const quoted = unwrapMessage(contextInfo?.quotedMessage);
   if (quoted?.videoMessage) {
     return {
       hasCommand: true,
+      action: 'create_sticker',
       mediaNode: quoted.videoMessage,
       mediaKind: 'video',
       fit,
+      showSoundPreview,
     };
   }
   if (isVideoDocument(quoted?.documentMessage)) {
     return {
       hasCommand: true,
+      action: 'create_sticker',
       mediaNode: quoted.documentMessage,
       mediaKind: 'document',
       fit,
+      showSoundPreview,
     };
   }
 
-  // El usuario escribió `.s2` pero no adjuntó ni citó un video
+  // 4) Si responde `.s2` a un sticker existente, muestra y extrae el sonido de ese sticker
+  if (quotedSticker) {
+    return {
+      hasCommand: true,
+      action: 'inspect_sound',
+      mediaNode: quotedSticker,
+      mediaKind: 'sticker',
+      fit,
+      showSoundPreview: true,
+    };
+  }
+
+  // El usuario escribió `.s2` pero no adjuntó ni citó un video ni un sticker
   return {
     hasCommand: true,
+    action: 'create_sticker',
     mediaNode: null,
     mediaKind: null,
     fit,
+    showSoundPreview,
   };
 }
 
@@ -171,9 +234,111 @@ export class CommandQueue {
     }
   }
 
+  async handleInspectStickerSound(sock, message, stickerNode) {
+    const chatJid = message.key?.remoteJid;
+    if (!chatJid) return;
+
+    if (!stickerNode) {
+      await sock.sendMessage(
+        chatJid,
+        {
+          text:
+            `🔊 *Ver sonido de un sticker*\n\n` +
+            `• Responde a cualquier *sticker con audio* escribiendo *${this.config.audioCommand}* (o *.sonido*) para ver su onda de sonido, duración, autor y escuchar su pista de audio.`,
+        },
+        { quoted: message }
+      );
+      return;
+    }
+
+    await safeReact(sock, message, '🔎');
+
+    try {
+      const embeddedAudio = getEmbeddedStickerAudio(stickerNode);
+      let exifMeta = null;
+      try {
+        const webpBuf = await downloadMediaToBuffer(stickerNode, 'sticker');
+        exifMeta = readWebpExif(webpBuf);
+      } catch {
+        // Si el WebP ya expiró en CDN igual intentamos leer el audio
+      }
+
+      const packName = exifMeta?.['sticker-pack-name'] || 'Sin descripción';
+      const packAuthor = exifMeta?.['sticker-pack-publisher'] || 'Desconocido';
+
+      if (!embeddedAudio) {
+        await safeReact(sock, message, 'ℹ️');
+        await sock.sendMessage(
+          chatJid,
+          {
+            text:
+              `🔇 *Este sticker no tiene pista de sonido*\n\n` +
+              `📦 *Descripción:* ${packName}\n` +
+              `✍️ *Autor:* ${packAuthor}\n` +
+              `🎞️ *Animado:* ${stickerNode.isAnimated ? 'Sí' : 'No'}`,
+          },
+          { quoted: message }
+        );
+        return;
+      }
+
+      const { audioBuffer, audioMessage } = await downloadSoundFromSticker(embeddedAudio);
+      const seconds = Number(audioMessage.seconds || 1);
+      const sizeKb = Math.max(1, Math.round(audioBuffer.length / 1024));
+      const mime = audioMessage.mimetype || 'audio/ogg; codecs=opus';
+      const bars = formatWaveformBars(audioMessage.waveform, 24);
+      const wfBytes =
+        audioMessage.waveform && audioMessage.waveform.length > 0
+          ? Uint8Array.from(audioMessage.waveform)
+          : new Uint8Array(64).fill(50);
+
+      await sock.sendMessage(
+        chatJid,
+        {
+          text:
+            `🔊 *Sonido del Sticker*\n\n` +
+            `📊 *Onda:* \`${bars}\`\n` +
+            `⏱️ *Duración:* ${seconds}s (${sizeKb} KB)\n` +
+            `🎵 *Formato:* ${mime}\n` +
+            `📦 *Descripción:* ${packName}\n` +
+            `✍️ *Autor:* ${packAuthor}`,
+        },
+        { quoted: message }
+      );
+
+      await sock.sendMessage(
+        chatJid,
+        {
+          audio: audioBuffer,
+          mimetype: 'audio/ogg; codecs=opus',
+          ptt: true,
+          seconds,
+          waveform: wfBytes,
+        },
+        { quoted: message }
+      );
+
+      await safeReact(sock, message, '🔊');
+    } catch (err) {
+      await safeReact(sock, message, '❌');
+      await sock.sendMessage(
+        chatJid,
+        {
+          text: `❌ No se pudo extraer el sonido del sticker:\n${err?.message || 'Error desconocido'}`,
+        },
+        { quoted: message }
+      );
+    }
+  }
+
   async handleJob(sock, message, parsedRequest) {
     const chatJid = message.key?.remoteJid;
     if (!chatJid) return;
+
+    if (parsedRequest.action === 'inspect_sound') {
+      await this.handleInspectStickerSound(sock, message, parsedRequest.mediaNode);
+      return;
+    }
 
     if (!parsedRequest.mediaNode) {
       await sock.sendMessage(
@@ -183,7 +348,10 @@ export class CommandQueue {
             `🎬 *Uso del comando ${this.config.command}*\n\n` +
             `• Envía un *video* con el texto *${this.config.command}* en el comentario, o\n` +
             `• Responde a un *video* escribiendo *${this.config.command}*\n\n` +
-            `💡 _Opcional:_ escribe *${this.config.command} full* para mantener bordes completos sin recortar a cuadrado.`,
+            `🔊 *Ver sonido de un sticker:*\n` +
+            `• Toca el botón *🔊* en la esquina del sticker en WhatsApp, o\n` +
+            `• Responde al sticker con *${this.config.audioCommand}* (o *.sonido*) para ver su onda y escuchar el audio aparte.\n\n` +
+            `💡 _Opciones:_ *${this.config.command} full* (sin recortar bordes) | *${this.config.command} ver* (envía también la nota de audio visible).`,
         },
         { quoted: message }
       );
@@ -218,9 +386,12 @@ export class CommandQueue {
       const sent = await sendSoundSticker(sock, chatJid, {
         webpBuffer: converted.webpBuffer,
         audioBuffer: converted.audioBuffer,
+        waveform: converted.waveform,
         durationMs: converted.durationMs,
+        firstFrameLength: converted.firstFrameLength,
         width: converted.width,
         height: converted.height,
+        sendAudioPreview: Boolean(parsedRequest.showSoundPreview),
         quoted: message,
       });
 
