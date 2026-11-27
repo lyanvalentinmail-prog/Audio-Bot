@@ -1,7 +1,10 @@
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
+import chalk from 'chalk';
 import pino from 'pino';
+import qrcode from 'qrcode';
 import makeWASocket, {
   Browsers,
   DisconnectReason,
@@ -14,45 +17,120 @@ import { config } from './src/config.js';
 import { checkFfmpeg } from './src/media.js';
 import { installSoundStickerProtoPatch } from './src/soundSticker.js';
 import { CommandQueue, parseCommandRequest } from './src/handler.js';
+import { EXIT_NEED_LINK, initBridge, underPanel } from './src/bridge.js';
+import {
+  cleanNumber,
+  evaluateSenderAccess,
+  getActiveSessionDir,
+  loadSettings,
+} from './src/settings.js';
+import { migrateLegacySession } from './src/sessions.js';
+import { printMessageLog } from './src/printlog.js';
 
 installSoundStickerProtoPatch();
+migrateLegacySession();
 
-const commandQueue = new CommandQueue(config);
+export const eventBus = new EventEmitter();
+eventBus.setMaxListeners(50);
+
+function broadcast(event, payload = {}) {
+  eventBus.emit(event, { payload, timestamp: Date.now() });
+}
+
+initBridge(eventBus);
+
+const commandQueue = new CommandQueue(config, broadcast);
 const processedIds = new Set();
 
 let activeSock = null;
 let reconnectTimer = null;
 let shuttingDown = false;
-let cachedPhoneNumber = config.phoneNumber;
+let cachedPhoneNumber = process.env.AUDIOBOT_PHONE || config.phoneNumber;
+
+const envMethod = (process.env.AUDIOBOT_METHOD || '').toLowerCase();
+const forceQR = process.argv.includes('--qr') || envMethod === 'qr';
+const forceCode =
+  process.argv.includes('--code') || process.argv.includes('code') || envMethod === 'code';
+
+function requestPanelLink(reason) {
+  console.log(chalk.yellow(`[ SESSION ] ${reason}`));
+  return new Promise(() => {
+    const exit = () => process.exit(EXIT_NEED_LINK);
+    if (!underPanel()) return exit();
+    setTimeout(exit, 800);
+    try {
+      process.send({ type: 'need_link', reason }, exit);
+    } catch {
+      exit();
+    }
+  });
+}
 
 /**
- * Solicita el número de WhatsApp por consola si aún no hay sesión vinculada
- * ni se definió PHONE_NUMBER en .env / argumentos CLI.
+ * Solicita el método y/o número de WhatsApp por consola si se ejecuta directo fuera del panel.
  */
-async function resolvePhoneNumber() {
-  // Permitir también pasarlo como argumento: `node index.js 59899123456`
-  const cliArg = (process.argv[2] || '').replace(/\D/g, '');
-  if (cliArg.length >= 8) {
-    cachedPhoneNumber = cliArg;
-    return cachedPhoneNumber;
+async function resolveDirectAuthChoice() {
+  if (forceQR) return { method: 'qr', phone: '' };
+
+  const cliPhone = (
+    process.argv.find((a) => /^\+?\d{8,15}$/.test(a.replace(/\D/g, ''))) || ''
+  ).replace(/\D/g, '');
+  if (cliPhone.length >= 8) {
+    cachedPhoneNumber = cliPhone;
+    return { method: 'code', phone: cachedPhoneNumber };
   }
 
-  if (cachedPhoneNumber && cachedPhoneNumber.length >= 8) {
-    return cachedPhoneNumber;
+  if (forceCode && cachedPhoneNumber.length >= 8) {
+    return { method: 'code', phone: cachedPhoneNumber };
+  }
+
+  if (underPanel() || !process.stdin.isTTY) {
+    await requestPanelLink(
+      'La sesión no está vinculada. Usa "Start" en el panel (npm start), o ejecuta "npm run qr" / "npm run code".'
+    );
   }
 
   const rl = readline.createInterface({ input, output });
   try {
+    let useQr = false;
+    if (!forceCode && !cachedPhoneNumber) {
+      const lineM = '⋯ ⋯ ⋯ ⋯ ⋯ ⋯ ⋯ ⋯ ⋯ ⋯ ⋯ 》';
+      console.log(chalk.white(`\n╭${lineM}`));
+      const opt = (
+        await rl.question(
+          `┊ ${chalk.bold.cyan(' METODO DE VINCULACION ')}\n` +
+            `┊ ${chalk.bold.white('⇢ Opcion 1:')} ${chalk.cyan('Codigo de 8 digitos (Pairing Code).')}\n` +
+            `┊ ${chalk.bold.white('⇢ Opcion 2:')} ${chalk.cyan('Codigo QR.')}\n` +
+            `╰${lineM}\n${chalk.bold.white('---> ')}`
+        )
+      ).trim();
+      useQr = opt === '2';
+    }
+
+    if (useQr) {
+      return { method: 'qr', phone: '' };
+    }
+
+    if (cachedPhoneNumber && cachedPhoneNumber.length >= 8) {
+      return { method: 'code', phone: cachedPhoneNumber };
+    }
+
     while (true) {
       const answer = await rl.question(
-        '\n📱 Ingresa tu número de WhatsApp con código de país (sin +, espacios ni guiones, ej: 59899123456): '
+        chalk.bold.white(
+          '\n📱 Ingresa tu número de WhatsApp con código de país (sin +, espacios ni guiones, ej: 59899123456): '
+        )
       );
-      const clean = answer.replace(/\D/g, '');
+      const clean = cleanNumber(answer);
       if (clean.length >= 8 && clean.length <= 15) {
         cachedPhoneNumber = clean;
-        return cachedPhoneNumber;
+        return { method: 'code', phone: cachedPhoneNumber };
       }
-      console.log('⚠️  Número inválido. Debe contener solo dígitos incluyendo el código de país (8 a 15 dígitos).');
+      console.log(
+        chalk.yellow(
+          '⚠️  Número inválido. Debe contener solo dígitos incluyendo el código de país (8 a 15 dígitos).'
+        )
+      );
     }
   } finally {
     rl.close();
@@ -69,30 +147,46 @@ async function verifyEnvironment() {
   try {
     await checkFfmpeg(config.ffmpegBin);
   } catch (err) {
-    console.warn('\n⚠️  Aviso FFmpeg:', err.message);
-    console.warn('   El bot puede vincularse, pero necesitarás FFmpeg instalado para usar .s2');
-    console.warn('   En Termux ejecuta: pkg update && pkg install ffmpeg -y\n');
+    console.warn(chalk.yellow(`\n⚠️  Aviso FFmpeg: ${err.message}`));
+    console.warn(
+      chalk.gray('   En Termux instálalo con: pkg update && pkg install ffmpeg -y\n')
+    );
   }
 }
 
 async function startBot() {
+  const sessionFolder = getActiveSessionDir();
+  await fs.mkdir(sessionFolder, { recursive: true });
+
   const logger = pino({ level: config.logLevel });
-  const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
+  let { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
 
   let version;
   try {
     const latest = await fetchLatestBaileysVersion();
     version = latest.version;
   } catch {
-    // Si falla la consulta HTTP de versión, Baileys usará su versión integrada por defecto
     version = undefined;
   }
 
-  const needsPairing = !state.creds.registered;
-  let phoneToPair = null;
-  if (needsPairing) {
-    phoneToPair = await resolvePhoneNumber();
+  const isLinked = Boolean(state.creds.registered || state.creds.account);
+  let linkMode = 'code';
+  let phoneToPair = '';
+
+  if (!isLinked) {
+    const choice = await resolveDirectAuthChoice();
+    linkMode = choice.method;
+    phoneToPair = choice.phone;
+
+    // Limpiar restos de intentos fallidos previos antes de pedir nuevo QR / código
+    await fs.rm(sessionFolder, { recursive: true, force: true }).catch(() => {});
+    await fs.mkdir(sessionFolder, { recursive: true });
+    const freshAuth = await useMultiFileAuthState(sessionFolder);
+    state = freshAuth.state;
+    saveCreds = freshAuth.saveCreds;
   }
+
+  broadcast('bot_status', { status: 'connecting' });
 
   const sock = makeWASocket({
     ...(version ? { version } : {}),
@@ -101,7 +195,6 @@ async function startBot() {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
-    // Ubuntu + Chrome es requerido por WhatsApp Web para generar Pairing Codes válidos
     browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false,
     markOnlineOnConnect: false,
@@ -117,53 +210,93 @@ async function startBot() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Cuando Baileys emite el primer evento de emparejamiento (`qr` o conexión abierta sin registrar),
-    // el handshake Noise ya está listo para solicitar el Pairing Code de 8 caracteres.
-    if (needsPairing && !pairingRequested && !sock.authState.creds.registered && (qr || connection === 'connecting')) {
-      if (qr) {
+    if (!isLinked && qr) {
+      if (linkMode === 'qr') {
+        try {
+          if (underPanel()) {
+            console.log(
+              chalk.bold.cyan(
+                '[ QR ] Nuevo código QR generado. Escanéalo desde WhatsApp › Dispositivos vinculados.'
+              )
+            );
+          } else {
+            const qrTerminal = await qrcode.toString(qr, { type: 'terminal', small: true });
+            console.log(chalk.bold.cyan('\n[ QR ] ESCANEA EL SIGUIENTE CÓDIGO QR:\n'));
+            console.log(qrTerminal);
+          }
+          broadcast('qr_generated', { qr });
+        } catch (err) {
+          console.error(chalk.red('[ ERROR ] Error al generar QR:'), err?.message || err);
+        }
+      } else if (!pairingRequested && !sock.authState.creds.registered) {
         pairingRequested = true;
         try {
           const code = await sock.requestPairingCode(phoneToPair);
           const formatted = formatPairingCode(code);
-          console.log('\n╔══════════════════════════════════════════════════╗');
-          console.log('║           🔗 CÓDIGO DE VINCULACIÓN               ║');
-          console.log(`║                 ${formatted.padEnd(16, ' ')}               ║`);
-          console.log('╚══════════════════════════════════════════════════╝');
-          console.log('👉 En WhatsApp ve a: Ajustes > Dispositivos vinculados >');
-          console.log('   Vincular un dispositivo > "Vincular con el número de teléfono"');
-          console.log(`   e introduce el código: ${formatted}\n`);
+          console.log(
+            chalk.white.bgBlue(' CODIGO DE VINCULACION '),
+            chalk.bold.white(`: ${formatted}`)
+          );
+          broadcast('pairing_code', { code: formatted });
         } catch (err) {
           pairingRequested = false;
-          console.error('❌ Error al solicitar el Pairing Code:', err?.message || err);
+          console.error(
+            chalk.red('❌ Error al solicitar el Pairing Code:'),
+            err?.message || err
+          );
+          if (underPanel()) {
+            await fs.rm(sessionFolder, { recursive: true, force: true }).catch(() => {});
+            await requestPanelLink(
+              'No se pudo generar el código de vinculación. Verifica el número con código de país e inténtalo de nuevo.'
+            );
+          }
         }
       }
     }
 
     if (connection === 'open') {
-      const userId = sock.user?.id || 'desconocido';
-      console.log(`\n✅ Conectado a WhatsApp como: ${userId}`);
-      console.log(`🎬 Comando crear sticker con audio: ${config.command} (pack: "${config.stickerPack}" | autor: "${config.stickerAuthor}")`);
-      console.log(`🔊 Comando ver sonido del sticker: ${config.audioCommand} / .sonido\n`);
+      const settings = loadSettings();
+      const rawUserId = sock.user?.id || '';
+      const number = cleanNumber(rawUserId);
+      console.log(
+        chalk.bold.cyan(
+          `\n✿ ${settings.botName} conectado (+${number || 'vinculado'}) · Comando: ${settings.prefix}s2 ✰\n`
+        )
+      );
+      broadcast('bot_status', {
+        status: 'connected',
+        botName: settings.botName,
+        number,
+        name: sock.user?.name || '',
+      });
     }
 
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const reason = lastDisconnect?.error?.message || 'Conexión cerrada';
       sock.ev.removeAllListeners();
+      broadcast('bot_status', { status: 'disconnected', statusCode });
 
       if (shuttingDown) return;
 
       if (statusCode === DisconnectReason.loggedOut) {
         console.error(
-          `\n🚪 Sesión cerrada desde WhatsApp (statusCode=${statusCode}).\n` +
-          `   Eliminando sesión en "${config.authDir}" para volver a vincular...`
+          chalk.yellow(
+            `\n🚪 Sesión cerrada desde WhatsApp (statusCode=${statusCode}). Limpiando vinculación...`
+          )
         );
-        await fs.rm(config.authDir, { recursive: true, force: true }).catch(() => {});
+        await fs.rm(sessionFolder, { recursive: true, force: true }).catch(() => {});
+        if (underPanel()) {
+          await requestPanelLink('La sesión se cerró desde WhatsApp. Usa "Start" para vincularla.');
+          return;
+        }
         scheduleReconnect(2000);
         return;
       }
 
-      console.log(`🔄 Conexión cerrada (${reason}, código=${statusCode ?? 'N/A'}). Reconectando en 3s...`);
+      console.log(
+        chalk.gray(`🔄 Conexión cerrada (${reason}, código=${statusCode ?? 'N/A'}). Reconectando en 3s...`)
+      );
       scheduleReconnect(3000);
     }
   });
@@ -176,19 +309,55 @@ async function startBot() {
       if (m.key.remoteJid === 'status@broadcast') continue;
       if (!config.allowSelf && m.key.fromMe) continue;
 
-      // En 'append' solo procesamos mensajes propios recién enviados para evitar reprocesar historial antiguo
       if (type === 'append' && !m.key.fromMe) continue;
 
       const dedupeKey = `${m.key.remoteJid}:${m.key.id}`;
       if (processedIds.has(dedupeKey)) continue;
 
-      const parsed = parseCommandRequest(m.message, config.command, config.audioCommand);
+      broadcast('message_received', {});
+      printMessageLog(m, sock).catch(() => {});
+
+      const settings = loadSettings();
+      const mainCmd = `${settings.prefix}s2`;
+      const audioCmd = `${settings.prefix}audio`;
+
+      const parsed = parseCommandRequest(m.message, mainCmd, audioCmd);
       if (!parsed) continue;
 
       processedIds.add(dedupeKey);
       if (processedIds.size > 1000) {
         const oldest = processedIds.values().next().value;
         processedIds.delete(oldest);
+      }
+
+      // Verificar permisos de Ajustes ("Solo el dueño" y lista de "Excluidos")
+      const botNumber = cleanNumber(sock.user?.id || sock.authState?.creds?.me?.id);
+      const botLid = cleanNumber(sock.user?.lid || sock.authState?.creds?.me?.lid);
+      const senderCandidates = [
+        m.key.participant,
+        m.key.participantAlt,
+        m.participant,
+        !m.key.remoteJid.endsWith('@g.us') ? m.key.remoteJid : '',
+        !m.key.remoteJid.endsWith('@g.us') ? m.key.remoteJidAlt : '',
+      ].filter(Boolean);
+
+      const access = evaluateSenderAccess({
+        senderCandidates,
+        fromMe: Boolean(m.key.fromMe),
+        botNumber,
+        botLid,
+        settings,
+      });
+
+      if (!access.allowed) {
+        broadcast('access_blocked', { reason: access.reason });
+        const who = senderCandidates.map(cleanNumber).find(Boolean) || 'desconocido';
+        console.log(
+          chalk.yellow(
+            `[ AJUSTES ] Uso bloqueado a +${who} (${access.reason === 'owner_only' ? 'Modo Solo el dueño' : 'Número excluido'})`
+          )
+        );
+        continue;
       }
 
       commandQueue.enqueue(sock, m, parsed);
@@ -223,6 +392,6 @@ function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-console.log('🤖 Iniciando Audio-Bot (Stickers con Audio para WhatsApp)...');
+console.log(chalk.cyan('🤖 Iniciando Audio-Bot (Stickers con Audio para WhatsApp)...'));
 await verifyEnvironment();
 await startBot();

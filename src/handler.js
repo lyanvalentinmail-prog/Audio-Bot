@@ -1,6 +1,7 @@
 import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 import { buildStickerExif, readWebpExif } from './exif.js';
 import { convertVideoBufferToSoundSticker } from './media.js';
+import { loadSettings } from './settings.js';
 import {
   downloadSoundFromSticker,
   formatWaveformBars,
@@ -82,8 +83,12 @@ export function parseCommandRequest(
   const parts = rawText.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   const mainTrigger = commandTrigger.toLowerCase();
+  const pfx = Array.from(mainTrigger)[0] || '.';
   const inspectTriggers = new Set([
     ...INSPECT_ALIASES,
+    `${pfx}audio`,
+    `${pfx}sonido`,
+    `${pfx}veraudio`,
     (audioCommandTrigger || '.audio').toLowerCase(),
   ]);
 
@@ -249,15 +254,28 @@ async function safeReact(sock, message, emoji) {
  * Cola secuencial para procesar conversiones FFmpeg de una en una sin saturar la CPU/RAM en Termux.
  */
 export class CommandQueue {
-  constructor(config) {
+  constructor(config, onEvent = null) {
     this.config = config;
+    this.onEvent = onEvent;
     this.queue = [];
     this.busy = false;
-    this.exifPayload = buildStickerExif({
-      pack: config.stickerPack,
-      author: config.stickerAuthor,
-      emojis: ['🔊'],
-    });
+    this.cachedExifKey = '';
+    this.exifPayload = null;
+  }
+
+  getExifPayload(pack, author) {
+    const p = pack || this.config.stickerPack || 'Made by';
+    const a = author || this.config.stickerAuthor || '@Lyan';
+    const key = `${p}\u0000${a}`;
+    if (this.cachedExifKey !== key || !this.exifPayload) {
+      this.cachedExifKey = key;
+      this.exifPayload = buildStickerExif({
+        pack: p,
+        author: a,
+        emojis: ['🔊'],
+      });
+    }
+    return this.exifPayload;
   }
 
   enqueue(sock, message, parsedRequest) {
@@ -364,7 +382,9 @@ export class CommandQueue {
       );
 
       await safeReact(sock, message, '🔊');
+      this.onEvent?.('command_executed', { command: this.config.audioCommand });
     } catch (err) {
+      this.onEvent?.('handler_error', { error: err?.message || String(err) });
       await safeReact(sock, message, '❌');
       await sock.sendMessage(
         chatJid,
@@ -380,6 +400,10 @@ export class CommandQueue {
     const chatJid = message.key?.remoteJid;
     if (!chatJid) return;
 
+    const liveSettings = loadSettings();
+    const cmdLabel = `${liveSettings.prefix}s2`;
+    const audioCmdLabel = `${liveSettings.prefix}audio`;
+
     if (parsedRequest.action === 'inspect_sound') {
       await this.handleInspectStickerSound(sock, message, parsedRequest.mediaNode);
       return;
@@ -390,14 +414,14 @@ export class CommandQueue {
         chatJid,
         {
           text:
-            `🎬 *Uso del comando ${this.config.command}*\n\n` +
-            `• Envía un *video* con el texto *${this.config.command}* en el comentario\n` +
-            `• Responde a un *video* escribiendo *${this.config.command}*\n` +
-            `• Pega un enlace de *TikTok*: *${this.config.command} https://vm.tiktok.com/...*\n\n` +
+            `🎬 *Uso del comando ${cmdLabel}*\n\n` +
+            `• Envía un *video* con el texto *${cmdLabel}* en el comentario\n` +
+            `• Responde a un *video* escribiendo *${cmdLabel}*\n` +
+            `• Pega un enlace de *TikTok*: *${cmdLabel} https://vm.tiktok.com/...*\n\n` +
             `🔊 *Ver sonido de un sticker:*\n` +
             `• Toca el botón *🔊* en la esquina del sticker en WhatsApp, o\n` +
-            `• Responde al sticker con *${this.config.audioCommand}* (o *.sonido*) para ver su onda y escuchar el audio aparte.\n\n` +
-            `💡 _Opciones:_ *${this.config.command} full* (elimina bordes negros y mantiene encuadre completo transparente) | *${this.config.command} ver* (envía también la nota de audio visible).`,
+            `• Responde al sticker con *${audioCmdLabel}* (o *${liveSettings.prefix}sonido*) para ver su onda y escuchar el audio aparte.\n\n` +
+            `💡 _Opciones:_ *${cmdLabel} full* (elimina bordes negros y mantiene encuadre completo transparente) | *${cmdLabel} ver* (envía también la nota de audio visible).`,
         },
         { quoted: message }
       );
@@ -407,7 +431,7 @@ export class CommandQueue {
     const msgId = message.key?.id || `msg_${Date.now()}`;
     const isTikTok = parsedRequest.mediaKind === 'tiktok' && Boolean(parsedRequest.tiktokUrl);
     console.log(
-      `[.s2] Procesando ${isTikTok ? `TikTok (${parsedRequest.tiktokUrl})` : `video (${msgId})`} de ${chatJid}...`
+      `[${cmdLabel}] Procesando ${isTikTok ? `TikTok (${parsedRequest.tiktokUrl})` : `video (${msgId})`} de ${chatJid}...`
     );
     await safeReact(sock, message, '⏳');
 
@@ -430,9 +454,9 @@ export class CommandQueue {
       const converted = await convertVideoBufferToSoundSticker(videoBuffer, {
         tmpDir: this.config.tmpDir,
         jobId: msgId,
-        maxSeconds: this.config.maxSeconds,
+        maxSeconds: liveSettings.maxSeconds || this.config.maxSeconds,
         maxWebpBytes: this.config.maxWebpBytes,
-        exifPayload: this.exifPayload,
+        exifPayload: this.getExifPayload(liveSettings.stickerPack, liveSettings.stickerAuthor),
         fit: parsedRequest.fit,
         ffmpegBin: this.config.ffmpegBin,
         ffprobeBin: this.config.ffprobeBin,
@@ -451,11 +475,13 @@ export class CommandQueue {
       });
 
       await safeReact(sock, message, '✅');
+      this.onEvent?.('command_executed', { command: cmdLabel });
       console.log(
-        `[.s2] Sticker enviado (${sent.messageId}) | origen=${isTikTok ? 'tiktok' : 'video'} | fit=${parsedRequest.fit} | audio=${sent.withAudio ? 'sí' : 'sin pista de audio'} | webp=${Math.round(converted.webpBuffer.length / 1024)}KB`
+        `[${cmdLabel}] Sticker enviado (${sent.messageId}) | origen=${isTikTok ? 'tiktok' : 'video'} | fit=${parsedRequest.fit} | audio=${sent.withAudio ? 'sí' : 'sin pista de audio'} | webp=${Math.round(converted.webpBuffer.length / 1024)}KB`
       );
     } catch (err) {
-      console.error(`[.s2] Error en ${msgId}:`, err?.message || err);
+      this.onEvent?.('handler_error', { error: err?.message || String(err) });
+      console.error(`[${cmdLabel}] Error en ${msgId}:`, err?.message || err);
       await safeReact(sock, message, '❌');
       try {
         await sock.sendMessage(
