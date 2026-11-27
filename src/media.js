@@ -91,21 +91,115 @@ export async function probeMedia(filePath, ffprobeBin = 'ffprobe', ffmpegBin = '
   }
 }
 
-function buildVideoFilter(detailSize, fps, fit = 'crop') {
-  const steps = [`fps=${fps}`];
+/**
+ * Parsea la salida de `ffmpeg -vf cropdetect` y devuelve el rectángulo activo más frecuente
+ * para recortar automáticamente bordes negros incrustados (letterbox / pillarbox).
+ */
+export function parseCropdetectOutput(logText, sourceWidth = 0, sourceHeight = 0) {
+  if (!logText || typeof logText !== 'string') return null;
+  const regex = /crop=(-?\d+):(-?\d+):(-?\d+):(-?\d+)/g;
+  const counts = new Map();
+  let match;
 
-  if (fit === 'contain') {
-    // Modo completo con bordes transparentes en 512x512
+  while ((match = regex.exec(logText)) !== null) {
+    const w = Number(match[1]);
+    const h = Number(match[2]);
+    const x = Number(match[3]);
+    const y = Number(match[4]);
+
+    // Ignorar valores degenerados o inválidos cuando la pantalla está en negro total
+    if (w < 48 || h < 48 || x < 0 || y < 0) continue;
+    if (sourceWidth > 0 && x + w > sourceWidth + 4) continue;
+    if (sourceHeight > 0 && y + h > sourceHeight + 4) continue;
+
+    const key = `${w}:${h}:${x}:${y}`;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+
+  if (counts.size === 0) return null;
+
+  let bestKey = null;
+  let bestCount = 0;
+  for (const [key, count] of counts.entries()) {
+    if (count >= bestCount) {
+      bestKey = key;
+      bestCount = count;
+    }
+  }
+
+  if (!bestKey) return null;
+  const [w, h, x, y] = bestKey.split(':').map(Number);
+
+  // Evitar recortar si el área detectada es prácticamente idéntica al video original
+  if (
+    sourceWidth > 0 &&
+    sourceHeight > 0 &&
+    w >= sourceWidth - 6 &&
+    h >= sourceHeight - 6
+  ) {
+    return null;
+  }
+
+  return `crop=${w}:${h}:${x}:${y}`;
+}
+
+/**
+ * Ejecuta una pasada rápida de `cropdetect` para detectar y eliminar bordes negros del video.
+ */
+export async function detectBlackBordersCrop(
+  filePath,
+  { maxSeconds = 6, sourceWidth = 0, sourceHeight = 0, ffmpegBin = 'ffmpeg' } = {}
+) {
+  const sampleSec = Math.max(1, Math.min(Number(maxSeconds) || 6, 8));
+  try {
+    const output = await new Promise((resolve) => {
+      execFile(
+        ffmpegBin,
+        [
+          '-hide_banner',
+          '-t',
+          String(sampleSec),
+          '-i',
+          filePath,
+          '-vf',
+          'fps=5,cropdetect=24:2:0',
+          '-an',
+          '-sn',
+          '-dn',
+          '-f',
+          'null',
+          '-',
+        ],
+        { timeout: 20_000, maxBuffer: 4 * 1024 * 1024 },
+        (_err, stdout, stderr) => {
+          resolve(`${stdout || ''}\n${stderr || ''}`);
+        }
+      );
+    });
+    return parseCropdetectOutput(output, sourceWidth, sourceHeight);
+  } catch {
+    return null;
+  }
+}
+
+export function buildVideoFilter(detailSize, fps, fit = 'crop', preCropExpr = null) {
+  const steps = [`fps=${fps}`];
+  if (preCropExpr) {
+    steps.push(preCropExpr);
+  }
+
+  if (fit === 'full') {
+    // `.s2 full`: tras quitar los bordes negros con cropdetect, encuadra el video limpio
+    // sobre un lienzo 512x512 transparente real (alfa RGBA, sin barras negras).
     steps.push(
       `scale=${detailSize}:${detailSize}:force_original_aspect_ratio=decrease:flags=lanczos`
     );
     if (detailSize < 512) {
-      steps.push(`scale=512:512:force_original_aspect_ratio=decrease:flags=bicubic`);
+      steps.push('scale=512:512:force_original_aspect_ratio=decrease:flags=bicubic');
     }
     steps.push(
       'format=rgba',
-      'pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black@0',
-      'format=yuva420p',
+      'pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000',
       'setsar=1'
     );
   } else {
@@ -133,13 +227,25 @@ export async function videoToAnimatedWebp(inputPath, outputPath, options = {}) {
     maxBytes = 900_000,
     exifPayload = null,
     fit = 'crop',
+    sourceWidth = 0,
+    sourceHeight = 0,
     ffmpegBin = 'ffmpeg',
   } = options;
 
   const trimArgs = maxSeconds > 0 ? ['-t', String(maxSeconds)] : [];
+  const normalizedFit = fit === 'contain' ? 'full' : fit;
+  const preCropExpr =
+    normalizedFit === 'full'
+      ? await detectBlackBordersCrop(inputPath, {
+          maxSeconds,
+          sourceWidth,
+          sourceHeight,
+          ffmpegBin,
+        })
+      : null;
 
   for (const [detailSize, quality, fps] of WEBP_LADDER) {
-    const vf = buildVideoFilter(detailSize, fps, fit);
+    const vf = buildVideoFilter(detailSize, fps, normalizedFit, preCropExpr);
     await runProcess(ffmpegBin, [
       '-y',
       '-v', 'error',
@@ -309,6 +415,10 @@ export async function convertVideoBufferToSoundSticker(videoBuffer, options = {}
       throw new Error('El archivo recibido no contiene una pista de video válida.');
     }
 
+    const videoStream = (probe.streams || []).find((s) => s.codec_type === 'video');
+    const sourceWidth = Number(videoStream?.width || 0);
+    const sourceHeight = Number(videoStream?.height || 0);
+
     const clipDuration =
       probe.duration > 0
         ? Math.min(probe.duration, maxSeconds > 0 ? maxSeconds : probe.duration)
@@ -319,6 +429,8 @@ export async function convertVideoBufferToSoundSticker(videoBuffer, options = {}
       maxBytes: maxWebpBytes,
       exifPayload,
       fit,
+      sourceWidth,
+      sourceHeight,
       ffmpegBin,
     });
 

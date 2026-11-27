@@ -5,7 +5,8 @@ import { getMediaKeys, proto } from '@whiskeysockets/baileys';
 
 import { config } from '../src/config.js';
 import { buildStickerExif, injectWebpExif, inspectWebp, readWebpExif } from '../src/exif.js';
-import { waveformFromPcm } from '../src/media.js';
+import { buildVideoFilter, parseCropdetectOutput, waveformFromPcm } from '../src/media.js';
+import { downloadTikTokVideoBuffer, extractTikTokUrl } from '../src/tiktok.js';
 import {
   createAudioStreamingSidecar,
   formatWaveformBars,
@@ -241,7 +242,43 @@ test('Handler: detecta .s2 para crear stickers y .audio / .sonido / .s2 sobre st
   assert.ok(quotedEphemeral);
   assert.equal(quotedEphemeral.action, 'create_sticker');
   assert.equal(quotedEphemeral.mediaKind, 'video');
-  assert.equal(quotedEphemeral.fit, 'contain');
+  assert.equal(quotedEphemeral.fit, 'full');
+
+  // Enlace de TikTok directo: .s2 https://vm.tiktok.com/ZMxyz123/
+  const tiktokDirect = parseCommandRequest(
+    { conversation: '.s2 https://vm.tiktok.com/ZMxyz123/' },
+    '.s2',
+    '.audio'
+  );
+  assert.ok(tiktokDirect);
+  assert.equal(tiktokDirect.action, 'create_sticker');
+  assert.equal(tiktokDirect.mediaKind, 'tiktok');
+  assert.equal(tiktokDirect.tiktokUrl, 'https://vm.tiktok.com/ZMxyz123/');
+  assert.equal(tiktokDirect.fit, 'crop');
+
+  // Enlace de TikTok citado con .s2 full
+  const tiktokQuotedFull = parseCommandRequest(
+    {
+      extendedTextMessage: {
+        text: '.s2 full',
+        contextInfo: {
+          quotedMessage: {
+            conversation: 'Mira esto https://www.tiktok.com/@usuario/video/7391234567890123456!',
+          },
+        },
+      },
+    },
+    '.s2',
+    '.audio'
+  );
+  assert.ok(tiktokQuotedFull);
+  assert.equal(tiktokQuotedFull.action, 'create_sticker');
+  assert.equal(tiktokQuotedFull.mediaKind, 'tiktok');
+  assert.equal(
+    tiktokQuotedFull.tiktokUrl,
+    'https://www.tiktok.com/@usuario/video/7391234567890123456'
+  );
+  assert.equal(tiktokQuotedFull.fit, 'full');
 
   // Responder .audio o .sonido a un sticker -> inspect_sound
   const inspectAudio = parseCommandRequest(
@@ -292,4 +329,89 @@ test('Handler: detecta .s2 para crear stickers y .audio / .sonido / .s2 sobre st
   assert.equal(ignored, null);
 
   assert.ok(unwrapMessage({ ephemeralMessage: { message: { conversation: 'ok' } } }));
+});
+
+test('Filtro .s2 full: recorta bordes negros (cropdetect) y preserva canal alfa RGBA sin franjas negras', () => {
+  const sampleLogs = [
+    '[Parsed_cropdetect_1 @ 0x1] x1:0 x2:719 y1:240 y2:1039 w:720 h:800 x:0 y:240 pts:1 crop=720:800:0:240',
+    '[Parsed_cropdetect_1 @ 0x1] x1:0 x2:719 y1:240 y2:1039 w:720 h:800 x:0 y:240 pts:2 crop=720:800:0:240',
+    '[Parsed_cropdetect_1 @ 0x1] x1:0 x2:719 y1:238 y2:1041 w:720 h:804 x:0 y:238 pts:3 crop=720:804:0:238',
+    '[Parsed_cropdetect_1 @ 0x1] x1:0 x2:719 y1:240 y2:1039 w:720 h:800 x:0 y:240 pts:4 crop=720:800:0:240',
+  ].join('\n');
+
+  const detected = parseCropdetectOutput(sampleLogs, 720, 1280);
+  assert.equal(detected, 'crop=720:800:0:240');
+
+  // Si el área detectada es prácticamente todo el fotograma, no recorta innecesariamente
+  const fullFrameLog = 'pts:1 crop=718:1278:0:2';
+  assert.equal(parseCropdetectOutput(fullFrameLog, 720, 1280), null);
+
+  // El filtro full incluye el pre-crop contra bordes negros y relleno transparente RGBA (sin yuva420p)
+  const vfFull = buildVideoFilter(512, 12, 'full', detected);
+  assert.ok(vfFull.includes('crop=720:800:0:240'));
+  assert.ok(vfFull.includes('format=rgba'));
+  assert.ok(vfFull.includes('color=0x00000000'));
+  assert.ok(!vfFull.includes('yuva420p'));
+});
+
+test('TikTok: extrae enlaces válidos y descarga el MP4 sin marca de agua mediante el resolvedor', async () => {
+  assert.equal(
+    extractTikTokUrl('.s2 https://vt.tiktok.com/ZS8abc123/'),
+    'https://vt.tiktok.com/ZS8abc123/'
+  );
+  assert.equal(extractTikTokUrl('sin enlace aquí'), null);
+
+  const fakeMp4 = Buffer.alloc(2048, 0x11);
+  const calls = [];
+
+  const mockFetch = async (url) => {
+    calls.push(String(url));
+    if (String(url).includes('vt.tiktok.com')) {
+      return {
+        ok: false,
+        status: 302,
+        headers: new Map([
+          ['location', 'https://www.tiktok.com/@lyan/video/7400000000000000000?is_from_webapp=1'],
+        ]),
+      };
+    }
+    if (String(url).includes('tikwm.com/api')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            code: 0,
+            data: {
+              id: '7400000000000000000',
+              title: 'Prueba TikTok',
+              duration: 7,
+              play: '/video/media/play/7400000000000000000.mp4',
+              author: { unique_id: 'lyan' },
+            },
+          };
+        },
+      };
+    }
+    if (String(url).includes('/video/media/play/')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map([['content-length', String(fakeMp4.length)]]),
+        async arrayBuffer() {
+          return fakeMp4.buffer.slice(fakeMp4.byteOffset, fakeMp4.byteOffset + fakeMp4.byteLength);
+        },
+      };
+    }
+    throw new Error(`URL inesperada en mock: ${url}`);
+  };
+
+  const result = await downloadTikTokVideoBuffer('https://vt.tiktok.com/ZS8abc123/', {
+    fetchImpl: mockFetch,
+  });
+
+  assert.equal(result.buffer.length, 2048);
+  assert.equal(result.provider, 'tikwm-post');
+  assert.equal(result.author, 'lyan');
+  assert.ok(calls.some((u) => u.includes('tikwm.com/api')));
 });
