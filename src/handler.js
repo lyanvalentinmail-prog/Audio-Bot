@@ -7,6 +7,7 @@ import {
   getEmbeddedStickerAudio,
   sendSoundSticker,
 } from './soundSticker.js';
+import { downloadTikTokVideoBuffer, extractTikTokUrl } from './tiktok.js';
 
 const INSPECT_ALIASES = new Set(['.audio', '.sonido', '.veraudio']);
 
@@ -47,10 +48,23 @@ function isVideoDocument(docMsg) {
   );
 }
 
+function extractMessageText(msg) {
+  if (!msg) return '';
+  return (
+    msg.videoMessage?.caption ||
+    msg.imageMessage?.caption ||
+    msg.documentMessage?.caption ||
+    msg.extendedTextMessage?.text ||
+    msg.conversation ||
+    ''
+  ).trim();
+}
+
 /**
  * Extrae el texto del mensaje y comprueba si invoca:
- * - `.s2` (crear sticker con audio desde video, o ver el sonido si responde a un sticker)
- *   - `.s2 full` / `.s2 completo` para no recortar bordes
+ * - `.s2` (crear sticker con audio desde video adjunto/citado o desde un enlace de TikTok, o ver el sonido si responde a un sticker)
+ *   - `.s2 full` / `.s2 completo` para eliminar bordes negros y mantener el video completo con margen transparente
+ *   - `.s2 <enlace de TikTok>` (o responder `.s2` a un mensaje con enlace de TikTok) para descargarlo y hacerlo sticker con audio
  *   - `.s2 ver` / `.s2 audio` para además adjuntar vista previa reproducible del sonido
  * - `.audio` / `.sonido` / `.veraudio` (ver la onda de sonido, metadatos y escuchar el audio de un sticker)
  */
@@ -62,14 +76,7 @@ export function parseCommandRequest(
   const msg = unwrapMessage(rawMessage);
   if (!msg) return null;
 
-  const rawText = (
-    msg.videoMessage?.caption ||
-    msg.documentMessage?.caption ||
-    msg.extendedTextMessage?.text ||
-    msg.conversation ||
-    ''
-  ).trim();
-
+  const rawText = extractMessageText(msg);
   if (!rawText) return null;
 
   const parts = rawText.split(/\s+/);
@@ -87,9 +94,13 @@ export function parseCommandRequest(
     return null;
   }
 
-  const argsText = parts.slice(1).join(' ').toLowerCase();
-  const fit = /\b(full|completo|entero|contain)\b/.test(argsText) ? 'contain' : 'crop';
-  const showSoundPreview = /\b(ver|audio|sonido|onda)\b/.test(argsText);
+  const restRaw = parts.slice(1).join(' ');
+  // Quitamos la URL de TikTok antes de evaluar palabras clave para que palabras en el link no activen flags por accidente
+  const directTikTokUrl = extractTikTokUrl(restRaw);
+  const flagsText = restRaw.replace(directTikTokUrl || '', ' ').toLowerCase();
+
+  const fit = /\b(full|completo|entero|contain)\b/.test(flagsText) ? 'full' : 'crop';
+  const showSoundPreview = /\b(ver|audio|sonido|onda)\b/.test(flagsText);
 
   const contextInfo =
     msg.extendedTextMessage?.contextInfo ||
@@ -99,6 +110,7 @@ export function parseCommandRequest(
 
   const quoted = unwrapMessage(contextInfo?.quotedMessage);
   const quotedSticker = quoted?.stickerMessage || null;
+  const quotedTikTokUrl = extractTikTokUrl(extractMessageText(quoted));
 
   // Comando dedicado a ver/extraer el sonido de un sticker (.audio / .sonido / .veraudio)
   if (isInspectCmd) {
@@ -107,42 +119,59 @@ export function parseCommandRequest(
       action: 'inspect_sound',
       mediaNode: quotedSticker || msg.stickerMessage || null,
       mediaKind: quotedSticker || msg.stickerMessage ? 'sticker' : null,
+      tiktokUrl: null,
       fit,
       showSoundPreview: true,
     };
   }
 
-  // 1) Video adjunto directamente en el mismo mensaje con caption `.s2`
+  // 1) Enlace de TikTok pasado directamente junto al comando: `.s2 https://vm.tiktok.com/...`
+  if (directTikTokUrl) {
+    return {
+      hasCommand: true,
+      action: 'create_sticker',
+      mediaNode: null,
+      mediaKind: 'tiktok',
+      tiktokUrl: directTikTokUrl,
+      fit,
+      showSoundPreview,
+    };
+  }
+
+  // 2) Video adjunto directamente en el mismo mensaje con caption `.s2`
   if (msg.videoMessage) {
     return {
       hasCommand: true,
       action: 'create_sticker',
       mediaNode: msg.videoMessage,
       mediaKind: 'video',
+      tiktokUrl: null,
       fit,
       showSoundPreview,
     };
   }
 
-  // 2) Video enviado como documento con caption `.s2`
+  // 3) Video enviado como documento con caption `.s2`
   if (isVideoDocument(msg.documentMessage)) {
     return {
       hasCommand: true,
       action: 'create_sticker',
       mediaNode: msg.documentMessage,
       mediaKind: 'document',
+      tiktokUrl: null,
       fit,
       showSoundPreview,
     };
   }
 
-  // 3) Respuesta (reply) a un mensaje previo que contiene un video o documento de video
+  // 4) Respuesta (reply) a un mensaje previo que contiene un video o documento de video
   if (quoted?.videoMessage) {
     return {
       hasCommand: true,
       action: 'create_sticker',
       mediaNode: quoted.videoMessage,
       mediaKind: 'video',
+      tiktokUrl: null,
       fit,
       showSoundPreview,
     };
@@ -153,29 +182,45 @@ export function parseCommandRequest(
       action: 'create_sticker',
       mediaNode: quoted.documentMessage,
       mediaKind: 'document',
+      tiktokUrl: null,
       fit,
       showSoundPreview,
     };
   }
 
-  // 4) Si responde `.s2` a un sticker existente, muestra y extrae el sonido de ese sticker
+  // 5) Respuesta (reply) con `.s2` a un mensaje que contiene un enlace de TikTok
+  if (quotedTikTokUrl) {
+    return {
+      hasCommand: true,
+      action: 'create_sticker',
+      mediaNode: null,
+      mediaKind: 'tiktok',
+      tiktokUrl: quotedTikTokUrl,
+      fit,
+      showSoundPreview,
+    };
+  }
+
+  // 6) Si responde `.s2` a un sticker existente, muestra y extrae el sonido de ese sticker
   if (quotedSticker) {
     return {
       hasCommand: true,
       action: 'inspect_sound',
       mediaNode: quotedSticker,
       mediaKind: 'sticker',
+      tiktokUrl: null,
       fit,
       showSoundPreview: true,
     };
   }
 
-  // El usuario escribió `.s2` pero no adjuntó ni citó un video ni un sticker
+  // El usuario escribió `.s2` pero no adjuntó ni citó un video, enlace de TikTok ni sticker
   return {
     hasCommand: true,
     action: 'create_sticker',
     mediaNode: null,
     mediaKind: null,
+    tiktokUrl: null,
     fit,
     showSoundPreview,
   };
@@ -340,18 +385,19 @@ export class CommandQueue {
       return;
     }
 
-    if (!parsedRequest.mediaNode) {
+    if (!parsedRequest.mediaNode && !parsedRequest.tiktokUrl) {
       await sock.sendMessage(
         chatJid,
         {
           text:
             `🎬 *Uso del comando ${this.config.command}*\n\n` +
-            `• Envía un *video* con el texto *${this.config.command}* en el comentario, o\n` +
-            `• Responde a un *video* escribiendo *${this.config.command}*\n\n` +
+            `• Envía un *video* con el texto *${this.config.command}* en el comentario\n` +
+            `• Responde a un *video* escribiendo *${this.config.command}*\n` +
+            `• Pega un enlace de *TikTok*: *${this.config.command} https://vm.tiktok.com/...*\n\n` +
             `🔊 *Ver sonido de un sticker:*\n` +
             `• Toca el botón *🔊* en la esquina del sticker en WhatsApp, o\n` +
             `• Responde al sticker con *${this.config.audioCommand}* (o *.sonido*) para ver su onda y escuchar el audio aparte.\n\n` +
-            `💡 _Opciones:_ *${this.config.command} full* (sin recortar bordes) | *${this.config.command} ver* (envía también la nota de audio visible).`,
+            `💡 _Opciones:_ *${this.config.command} full* (elimina bordes negros y mantiene encuadre completo transparente) | *${this.config.command} ver* (envía también la nota de audio visible).`,
         },
         { quoted: message }
       );
@@ -359,16 +405,25 @@ export class CommandQueue {
     }
 
     const msgId = message.key?.id || `msg_${Date.now()}`;
-    console.log(`[.s2] Procesando video (${msgId}) de ${chatJid}...`);
+    const isTikTok = parsedRequest.mediaKind === 'tiktok' && Boolean(parsedRequest.tiktokUrl);
+    console.log(
+      `[.s2] Procesando ${isTikTok ? `TikTok (${parsedRequest.tiktokUrl})` : `video (${msgId})`} de ${chatJid}...`
+    );
     await safeReact(sock, message, '⏳');
 
     try {
-      const videoBuffer = await downloadMediaToBuffer(
-        parsedRequest.mediaNode,
-        parsedRequest.mediaKind
-      );
+      let videoBuffer;
+      if (isTikTok) {
+        const downloaded = await downloadTikTokVideoBuffer(parsedRequest.tiktokUrl);
+        videoBuffer = downloaded.buffer;
+      } else {
+        videoBuffer = await downloadMediaToBuffer(
+          parsedRequest.mediaNode,
+          parsedRequest.mediaKind
+        );
+      }
 
-      if (!videoBuffer.length) {
+      if (!videoBuffer?.length) {
         throw new Error('No se pudo descargar el video o está vacío.');
       }
 
@@ -397,7 +452,7 @@ export class CommandQueue {
 
       await safeReact(sock, message, '✅');
       console.log(
-        `[.s2] Sticker enviado (${sent.messageId}) | audio=${sent.withAudio ? 'sí' : 'sin pista de audio'} | webp=${Math.round(converted.webpBuffer.length / 1024)}KB`
+        `[.s2] Sticker enviado (${sent.messageId}) | origen=${isTikTok ? 'tiktok' : 'video'} | fit=${parsedRequest.fit} | audio=${sent.withAudio ? 'sí' : 'sin pista de audio'} | webp=${Math.round(converted.webpBuffer.length / 1024)}KB`
       );
     } catch (err) {
       console.error(`[.s2] Error en ${msgId}:`, err?.message || err);
@@ -406,7 +461,7 @@ export class CommandQueue {
         await sock.sendMessage(
           chatJid,
           {
-            text: `❌ No se pudo convertir el video a sticker con audio:\n${err?.message || 'Error desconocido'}`,
+            text: `❌ No se pudo convertir ${isTikTok ? 'el enlace de TikTok' : 'el video'} a sticker con audio:\n${err?.message || 'Error desconocido'}`,
           },
           { quoted: message }
         );
