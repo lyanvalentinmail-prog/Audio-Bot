@@ -293,14 +293,15 @@ async function safeReact(sock, message, emoji) {
 }
 
 /**
- * Cola secuencial para procesar conversiones FFmpeg de una en una sin saturar la CPU/RAM en Termux.
+ * Cola con concurrencia controlada para procesar conversiones FFmpeg rápidamente sin saturar la RAM en Termux.
  */
 export class CommandQueue {
   constructor(config, onEvent = null) {
     this.config = config;
     this.onEvent = onEvent;
     this.queue = [];
-    this.busy = false;
+    this.activeCount = 0;
+    this.maxConcurrency = Math.max(1, Number(config?.concurrency) || 2);
     this.cachedExifKey = '';
     this.exifPayload = null;
   }
@@ -325,17 +326,15 @@ export class CommandQueue {
     this.pump();
   }
 
-  async pump() {
-    if (this.busy) return;
-    const next = this.queue.shift();
-    if (!next) return;
-
-    this.busy = true;
-    try {
-      await this.handleJob(next.sock, next.message, next.parsedRequest);
-    } finally {
-      this.busy = false;
-      this.pump();
+  pump() {
+    while (this.activeCount < this.maxConcurrency && this.queue.length > 0) {
+      const next = this.queue.shift();
+      if (!next) break;
+      this.activeCount++;
+      this.handleJob(next.sock, next.message, next.parsedRequest).finally(() => {
+        this.activeCount--;
+        this.pump();
+      });
     }
   }
 
@@ -472,6 +471,7 @@ export class CommandQueue {
     }
 
     const msgId = message.key?.id || `msg_${Date.now()}`;
+    const startedAt = Date.now();
     const isTikTok = parsedRequest.mediaKind === 'tiktok' && Boolean(parsedRequest.tiktokUrl);
     const isPinterest =
       parsedRequest.mediaKind === 'pinterest' && Boolean(parsedRequest.pinterestUrl);
@@ -481,7 +481,8 @@ export class CommandQueue {
       ? `Pinterest (${parsedRequest.pinterestUrl})`
       : `video (${msgId})`;
     console.log(`[${cmdLabel}] Procesando ${sourceLabel} de ${chatJid}...`);
-    await safeReact(sock, message, '⏳');
+    // Lanzamos la reacción en segundo plano sin bloquear el arranque de descarga + FFmpeg
+    void safeReact(sock, message, '⏳');
 
     try {
       let videoBuffer;
@@ -525,11 +526,12 @@ export class CommandQueue {
         quoted: message,
       });
 
-      await safeReact(sock, message, '✅');
+      void safeReact(sock, message, '✅');
       this.onEvent?.('command_executed', { command: cmdLabel });
       const originTag = isTikTok ? 'tiktok' : isPinterest ? 'pinterest' : 'video';
+      const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(2);
       console.log(
-        `[${cmdLabel}] Sticker enviado (${sent.messageId}) | origen=${originTag} | fit=${parsedRequest.fit} | audio=${sent.withAudio ? 'sí' : 'sin pista de audio'} | webp=${Math.round(converted.webpBuffer.length / 1024)}KB`
+        `[${cmdLabel}] Sticker enviado en ${elapsedSec}s (${sent.messageId}) | origen=${originTag} | fit=${parsedRequest.fit} | audio=${sent.withAudio ? 'sí' : 'sin pista de audio'} | webp=${Math.round(converted.webpBuffer.length / 1024)}KB`
       );
     } catch (err) {
       this.onEvent?.('handler_error', { error: err?.message || String(err) });

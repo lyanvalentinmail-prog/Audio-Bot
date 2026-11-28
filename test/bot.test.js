@@ -8,7 +8,12 @@ import { getMediaKeys, proto } from '@whiskeysockets/baileys';
 
 import { config } from '../src/config.js';
 import { buildStickerExif, injectWebpExif, inspectWebp, readWebpExif } from '../src/exif.js';
-import { buildVideoFilter, parseCropdetectOutput, waveformFromPcm } from '../src/media.js';
+import {
+  buildVideoFilter,
+  parseCropdetectOutput,
+  selectInitialLadderIndex,
+  waveformFromPcm,
+} from '../src/media.js';
 import {
   downloadPinterestVideoBuffer,
   extractPinId,
@@ -396,12 +401,20 @@ test('Filtro .s2 full: recorta bordes negros (cropdetect) y preserva canal alfa 
   const fullFrameLog = 'pts:1 crop=718:1278:0:2';
   assert.equal(parseCropdetectOutput(fullFrameLog, 720, 1280), null);
 
-  // El filtro full incluye el pre-crop contra bordes negros y relleno transparente RGBA (sin yuva420p)
+  // El filtro full incluye el pre-crop contra bordes negros, escalado rápido y relleno transparente RGBA
   const vfFull = buildVideoFilter(512, 12, 'full', detected);
   assert.ok(vfFull.includes('crop=720:800:0:240'));
+  assert.ok(vfFull.includes('fast_bilinear'));
   assert.ok(vfFull.includes('format=rgba'));
   assert.ok(vfFull.includes('color=0x00000000'));
   assert.ok(!vfFull.includes('yuva420p'));
+
+  // El selector adaptativo evita pasadas WebP innecesarias según la duración del clip
+  assert.equal(selectInitialLadderIndex(2.5, 'crop'), 0);
+  assert.equal(selectInitialLadderIndex(5.0, 'crop'), 1);
+  assert.equal(selectInitialLadderIndex(7.0, 'crop'), 2);
+  assert.equal(selectInitialLadderIndex(9.5, 'crop'), 3);
+  assert.ok(selectInitialLadderIndex(7.0, 'full') >= selectInitialLadderIndex(7.0, 'crop'));
 });
 
 test('TikTok: extrae enlaces válidos y descarga el MP4 sin marca de agua mediante el resolvedor', async () => {

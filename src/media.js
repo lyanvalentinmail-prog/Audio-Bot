@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { injectWebpExif, inspectWebp } from './exif.js';
 
@@ -10,14 +11,58 @@ import { injectWebpExif, inspectWebp } from './exif.js';
  * para cumplir siempre con el lienzo estándar de stickers de WhatsApp.
  */
 export const WEBP_LADDER = [
-  [512, 60, 15],
-  [512, 48, 12],
-  [384, 50, 12],
+  [512, 56, 14],
+  [512, 46, 12],
+  [384, 48, 12],
   [384, 38, 10],
   [320, 35, 10],
-  [256, 30, 8],
+  [256, 28, 8],
   [256, 20, 6],
 ];
+
+/**
+ * Devuelve el índice inicial óptimo de `WEBP_LADDER` según la duración real del clip y el modo (`crop` o `full`).
+ * Evita hacer 2–4 codificaciones completas de `libwebp` que de antemano superarían los 900 KB en clips largos.
+ */
+export function selectInitialLadderIndex(clipDurationSec = 4, fit = 'crop') {
+  const dur = Math.max(0.5, Number(clipDurationSec) || 4);
+  // `.s2 full` codifica canal alfa RGBA (mayor peso por frame que YUV420p)
+  const effectiveDur = fit === 'full' ? dur * 1.18 : dur;
+
+  if (effectiveDur <= 3.2) return 0; // <= ~3s: máxima calidad 512p @ 14fps
+  if (effectiveDur <= 5.5) return 1; // ~3-5.5s: 512p @ 12fps (entra al 1er intento casi siempre)
+  if (effectiveDur <= 7.8) return 2; // ~5.5-7.8s: 384->512 @ 12fps
+  return 3;                          // > ~7.8s: 384->512 @ 10fps
+}
+
+/**
+ * Resuelve un directorio temporal ultra-rápido (en RAM `/dev/shm` si existe y es escribible, o `fallbackDir`).
+ */
+let cachedFastTmpBase = null;
+async function resolveFastTmpDir(fallbackDir) {
+  if (fallbackDir && process.env.FORCE_DISK_TMP === '1') {
+    await fs.mkdir(fallbackDir, { recursive: true });
+    return fallbackDir;
+  }
+  if (cachedFastTmpBase) {
+    return cachedFastTmpBase;
+  }
+  try {
+    const shmStat = await fs.stat('/dev/shm');
+    if (shmStat.isDirectory()) {
+      const candidate = path.join('/dev/shm', 'audiobot-tmp');
+      await fs.mkdir(candidate, { recursive: true });
+      cachedFastTmpBase = candidate;
+      return candidate;
+    }
+  } catch {
+    // En Android/Termux puede no existir /dev/shm; usamos tmpDir normal
+  }
+  const resolvedFallback = fallbackDir || path.join(os.tmpdir(), 'audiobot-tmp');
+  await fs.mkdir(resolvedFallback, { recursive: true });
+  cachedFastTmpBase = resolvedFallback;
+  return resolvedFallback;
+}
 
 export function runProcess(bin, args, timeoutMs = 120_000) {
   return new Promise((resolve, reject) => {
@@ -48,17 +93,23 @@ export async function checkFfmpeg(ffmpegBin = 'ffmpeg') {
 }
 
 /**
- * Analiza el archivo multimedia usando ffprobe (o ffmpeg como respaldo si ffprobe no está).
+ * Analiza el archivo multimedia usando ffprobe con sondeo reducido (o ffmpeg como respaldo).
  */
 export async function probeMedia(filePath, ffprobeBin = 'ffprobe', ffmpegBin = 'ffmpeg') {
   try {
-    const { stdout } = await runProcess(ffprobeBin, [
-      '-v', 'error',
-      '-show_entries', 'stream=codec_type,codec_name,width,height,duration',
-      '-show_entries', 'format=duration',
-      '-of', 'json',
-      filePath,
-    ]);
+    const { stdout } = await runProcess(
+      ffprobeBin,
+      [
+        '-v', 'error',
+        '-probesize', '2M',
+        '-analyzeduration', '2M',
+        '-show_entries', 'stream=codec_type,codec_name,width,height,duration',
+        '-show_entries', 'format=duration',
+        '-of', 'json',
+        filePath,
+      ],
+      15_000
+    );
     const parsed = JSON.parse(stdout);
     const streams = parsed.streams || [];
     const hasVideo = streams.some((s) => s.codec_type === 'video');
@@ -73,7 +124,7 @@ export async function probeMedia(filePath, ffprobeBin = 'ffprobe', ffmpegBin = '
   } catch {
     // Respaldo con `ffmpeg -i` por si ffprobe no estuviese disponible
     const info = await new Promise((resolve) => {
-      execFile(ffmpegBin, ['-hide_banner', '-i', filePath], { timeout: 20_000 }, (_err, stdout, stderr) => {
+      execFile(ffmpegBin, ['-hide_banner', '-i', filePath], { timeout: 15_000 }, (_err, stdout, stderr) => {
         resolve(`${stdout || ''}\n${stderr || ''}`);
       });
     });
@@ -144,33 +195,31 @@ export function parseCropdetectOutput(logText, sourceWidth = 0, sourceHeight = 0
 }
 
 /**
- * Ejecuta una pasada rápida de `cropdetect` para detectar y eliminar bordes negros del video.
+ * Ejecuta una pasada ultrarrápida de `cropdetect` solo sobre keyframes (~2.5s) para eliminar bordes negros.
  */
 export async function detectBlackBordersCrop(
   filePath,
-  { maxSeconds = 6, sourceWidth = 0, sourceHeight = 0, ffmpegBin = 'ffmpeg' } = {}
+  { maxSeconds = 4, sourceWidth = 0, sourceHeight = 0, ffmpegBin = 'ffmpeg' } = {}
 ) {
-  const sampleSec = Math.max(1, Math.min(Number(maxSeconds) || 6, 8));
+  const sampleSec = Math.max(1, Math.min(Number(maxSeconds) || 3, 3));
   try {
     const output = await new Promise((resolve) => {
       execFile(
         ffmpegBin,
         [
           '-hide_banner',
-          '-t',
-          String(sampleSec),
-          '-i',
-          filePath,
-          '-vf',
-          'fps=5,cropdetect=24:2:0',
+          '-skip_frame', 'nokey',
+          '-t', String(sampleSec),
+          '-threads', '0',
+          '-i', filePath,
+          '-vf', 'fps=3,cropdetect=24:2:0',
           '-an',
           '-sn',
           '-dn',
-          '-f',
-          'null',
+          '-f', 'null',
           '-',
         ],
-        { timeout: 20_000, maxBuffer: 4 * 1024 * 1024 },
+        { timeout: 10_000, maxBuffer: 2 * 1024 * 1024 },
         (_err, stdout, stderr) => {
           resolve(`${stdout || ''}\n${stderr || ''}`);
         }
@@ -192,10 +241,10 @@ export function buildVideoFilter(detailSize, fps, fit = 'crop', preCropExpr = nu
     // `.s2 full`: tras quitar los bordes negros con cropdetect, encuadra el video limpio
     // sobre un lienzo 512x512 transparente real (alfa RGBA, sin barras negras).
     steps.push(
-      `scale=${detailSize}:${detailSize}:force_original_aspect_ratio=decrease:flags=lanczos`
+      `scale=${detailSize}:${detailSize}:force_original_aspect_ratio=decrease:flags=fast_bilinear`
     );
     if (detailSize < 512) {
-      steps.push('scale=512:512:force_original_aspect_ratio=decrease:flags=bicubic');
+      steps.push('scale=512:512:force_original_aspect_ratio=decrease:flags=bilinear');
     }
     steps.push(
       'format=rgba',
@@ -205,11 +254,11 @@ export function buildVideoFilter(detailSize, fps, fit = 'crop', preCropExpr = nu
   } else {
     // Modo recorte cuadrado centrado (512x512 completo sin bordes)
     steps.push(
-      `scale=${detailSize}:${detailSize}:force_original_aspect_ratio=increase:flags=lanczos`,
+      `scale=${detailSize}:${detailSize}:force_original_aspect_ratio=increase:flags=fast_bilinear`,
       `crop=${detailSize}:${detailSize}`
     );
     if (detailSize < 512) {
-      steps.push('scale=512:512:flags=bicubic');
+      steps.push('scale=512:512:flags=bilinear');
     }
     steps.push('format=yuv420p', 'setsar=1');
   }
@@ -218,12 +267,56 @@ export function buildVideoFilter(detailSize, fps, fit = 'crop', preCropExpr = nu
 }
 
 /**
- * Convierte un video a WebP animado 512x512 ajustando automáticamente calidad/FPS
- * para mantenerse dentro de `maxBytes` e inyecta los metadatos EXIF de WhatsApp.
+ * Codifica un escalón específico de WebP animado usando parámetros rápidos (`-compression_level 1`).
+ */
+async function encodeWebpStep(inputPath, outputPath, {
+  detailSize,
+  quality,
+  fps,
+  normalizedFit,
+  preCropExpr,
+  maxSeconds,
+  exifPayload,
+  ffmpegBin,
+}) {
+  const inputTrimArgs = maxSeconds > 0 ? ['-t', String(maxSeconds)] : [];
+  const vf = buildVideoFilter(detailSize, fps, normalizedFit, preCropExpr);
+
+  await runProcess(ffmpegBin, [
+    '-y',
+    '-v', 'error',
+    '-threads', '0',
+    ...inputTrimArgs,
+    '-i', inputPath,
+    '-vf', vf,
+    '-loop', '0',
+    '-c:v', 'libwebp',
+    '-lossless', '0',
+    '-q:v', String(quality),
+    // Nivel 1 es ~3.5x-5x más veloz en ARM/Termux que el nivel 4, con tamaño casi idéntico
+    '-compression_level', '1',
+    '-preset', 'drawing',
+    '-an',
+    '-sn',
+    '-dn',
+    '-f', 'webp',
+    outputPath,
+  ]);
+
+  const rawBuf = await fs.readFile(outputPath);
+  return exifPayload
+    ? injectWebpExif(rawBuf, exifPayload, { width: 512, height: 512 })
+    : rawBuf;
+}
+
+/**
+ * Convierte un video a WebP animado 512x512 eligiendo de entrada el perfil óptimo según duración
+ * y haciendo saltos adaptativos si excede `maxBytes` (evita múltiples recodificaciones lentas).
  */
 export async function videoToAnimatedWebp(inputPath, outputPath, options = {}) {
   const {
     maxSeconds = 10,
+    clipDuration = 0,
     maxBytes = 900_000,
     exifPayload = null,
     fit = 'crop',
@@ -232,41 +325,38 @@ export async function videoToAnimatedWebp(inputPath, outputPath, options = {}) {
     ffmpegBin = 'ffmpeg',
   } = options;
 
-  const trimArgs = maxSeconds > 0 ? ['-t', String(maxSeconds)] : [];
   const normalizedFit = fit === 'contain' ? 'full' : fit;
+  const effectiveDuration =
+    clipDuration > 0
+      ? Math.min(clipDuration, maxSeconds > 0 ? maxSeconds : clipDuration)
+      : maxSeconds;
+
   const preCropExpr =
     normalizedFit === 'full'
       ? await detectBlackBordersCrop(inputPath, {
-          maxSeconds,
+          maxSeconds: effectiveDuration,
           sourceWidth,
           sourceHeight,
           ffmpegBin,
         })
       : null;
 
-  for (const [detailSize, quality, fps] of WEBP_LADDER) {
-    const vf = buildVideoFilter(detailSize, fps, normalizedFit, preCropExpr);
-    await runProcess(ffmpegBin, [
-      '-y',
-      '-v', 'error',
-      '-i', inputPath,
-      ...trimArgs,
-      '-vf', vf,
-      '-loop', '0',
-      '-c:v', 'libwebp',
-      '-lossless', '0',
-      '-q:v', String(quality),
-      '-compression_level', '4',
-      '-preset', 'default',
-      '-an',
-      '-f', 'webp',
-      outputPath,
-    ]);
+  let idx = selectInitialLadderIndex(effectiveDuration, normalizedFit);
+  const tried = new Set();
 
-    const rawBuf = await fs.readFile(outputPath);
-    const stampedBuf = exifPayload
-      ? injectWebpExif(rawBuf, exifPayload, { width: 512, height: 512 })
-      : rawBuf;
+  while (idx < WEBP_LADDER.length) {
+    tried.add(idx);
+    const [detailSize, quality, fps] = WEBP_LADDER[idx];
+    const stampedBuf = await encodeWebpStep(inputPath, outputPath, {
+      detailSize,
+      quality,
+      fps,
+      normalizedFit,
+      preCropExpr,
+      maxSeconds,
+      exifPayload,
+      ffmpegBin,
+    });
 
     if (stampedBuf.length <= maxBytes) {
       const info = inspectWebp(stampedBuf);
@@ -281,6 +371,15 @@ export async function videoToAnimatedWebp(inputPath, outputPath, options = {}) {
         fps,
       };
     }
+
+    // Salto inteligente proporcional al exceso de peso para resolver en el siguiente intento
+    const ratio = stampedBuf.length / maxBytes;
+    const jump = ratio > 1.85 ? 3 : ratio > 1.35 ? 2 : 1;
+    let nextIdx = idx + jump;
+    if (nextIdx >= WEBP_LADDER.length && !tried.has(WEBP_LADDER.length - 1)) {
+      nextIdx = WEBP_LADDER.length - 1;
+    }
+    idx = nextIdx;
   }
 
   throw new Error(
@@ -336,15 +435,16 @@ export async function videoToStickerOpus(inputPath, outputPath, options = {}) {
 
   // Dejar el audio apenas ~0.05s más corto que el tope absorbe el padding final de Opus
   const effectiveMax = maxSeconds > 0.2 ? Math.max(0.2, maxSeconds - 0.05) : maxSeconds;
-  const trimArgs = effectiveMax > 0 ? ['-t', effectiveMax.toFixed(3)] : [];
+  const inputTrimArgs = effectiveMax > 0 ? ['-t', effectiveMax.toFixed(3)] : [];
 
   try {
     await runProcess(ffmpegBin, [
       '-y',
       '-v', 'error',
+      '-threads', '0',
+      ...inputTrimArgs,
       '-i', inputPath,
-      // Salida 1: Ogg/Opus mono 48 kHz
-      ...trimArgs,
+      // Salida 1: Ogg/Opus mono 48 kHz con compresión rápida
       '-map', '0:a:0',
       '-vn',
       '-sn',
@@ -353,19 +453,19 @@ export async function videoToStickerOpus(inputPath, outputPath, options = {}) {
       '-ar', '48000',
       '-af', 'aresample=48000:first_pts=0,afade=t=in:st=0:d=0.02',
       '-c:a', 'libopus',
-      '-b:a', '48k',
+      '-b:a', '40k',
       '-vbr', 'on',
+      '-compression_level', '5',
       '-application', 'audio',
       '-avoid_negative_ts', 'make_zero',
       '-map_metadata', '-1',
       '-f', 'ogg',
       outputPath,
-      // Salida 2: PCM 8 kHz s16le para calcular las 64 barras del waveform visual
-      ...trimArgs,
+      // Salida 2: PCM 4 kHz s16le ultraligero para calcular las 64 barras del waveform visual
       '-map', '0:a:0',
       '-vn',
       '-ac', '1',
-      '-ar', '8000',
+      '-ar', '4000',
       '-c:a', 'pcm_s16le',
       '-f', 's16le',
       pcmPath,
@@ -388,7 +488,8 @@ export async function videoToStickerOpus(inputPath, outputPath, options = {}) {
 }
 
 /**
- * Pipeline completo: convierte un Buffer de video en WebP animado + pista Ogg/Opus + waveform.
+ * Pipeline completo paralelo: convierte un Buffer de video en WebP animado + pista Ogg/Opus + waveform
+ * ejecutando video y audio simultáneamente sobre almacenamiento temporal rápido.
  */
 export async function convertVideoBufferToSoundSticker(videoBuffer, options = {}) {
   const {
@@ -402,11 +503,11 @@ export async function convertVideoBufferToSoundSticker(videoBuffer, options = {}
     ffprobeBin = 'ffprobe',
   } = options;
 
-  await fs.mkdir(tmpDir, { recursive: true });
+  const workDir = await resolveFastTmpDir(tmpDir);
   const safeId = jobId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  const inFile = path.join(tmpDir, `${safeId}.mp4`);
-  const webpFile = path.join(tmpDir, `${safeId}.webp`);
-  const oggFile = path.join(tmpDir, `${safeId}.ogg`);
+  const inFile = path.join(workDir, `${safeId}.mp4`);
+  const webpFile = path.join(workDir, `${safeId}.webp`);
+  const oggFile = path.join(workDir, `${safeId}.ogg`);
 
   try {
     await fs.writeFile(inFile, videoBuffer);
@@ -424,27 +525,25 @@ export async function convertVideoBufferToSoundSticker(videoBuffer, options = {}
         ? Math.min(probe.duration, maxSeconds > 0 ? maxSeconds : probe.duration)
         : maxSeconds;
 
-    const webpResult = await videoToAnimatedWebp(inFile, webpFile, {
-      maxSeconds,
-      maxBytes: maxWebpBytes,
-      exifPayload,
-      fit,
-      sourceWidth,
-      sourceHeight,
-      ffmpegBin,
-    });
-
-    const targetAudioSeconds =
-      webpResult.durationMs > 0
-        ? Math.min(maxSeconds > 0 ? maxSeconds : webpResult.durationMs / 1000, webpResult.durationMs / 1000)
-        : clipDuration;
-
-    const audioResult = probe.hasAudio
-      ? await videoToStickerOpus(inFile, oggFile, {
-          maxSeconds: targetAudioSeconds,
-          ffmpegBin,
-        }).catch(() => null)
-      : null;
+    // Ejecutamos en paralelo la conversión WebP y la extracción Opus + waveform para aprovechar todos los núcleos
+    const [webpResult, audioResult] = await Promise.all([
+      videoToAnimatedWebp(inFile, webpFile, {
+        maxSeconds,
+        clipDuration,
+        maxBytes: maxWebpBytes,
+        exifPayload,
+        fit,
+        sourceWidth,
+        sourceHeight,
+        ffmpegBin,
+      }),
+      probe.hasAudio
+        ? videoToStickerOpus(inFile, oggFile, {
+            maxSeconds: clipDuration,
+            ffmpegBin,
+          }).catch(() => null)
+        : Promise.resolve(null),
+    ]);
 
     const audioBuffer = audioResult?.audioBuffer || null;
     const waveform = audioResult?.waveform || null;
