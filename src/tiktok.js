@@ -71,8 +71,8 @@ async function resolveViaTikwmPost(targetUrl, fetchImpl) {
       Origin: TIKWM_ORIGIN,
       Referer: `${TIKWM_ORIGIN}/`,
     },
-    body: new URLSearchParams({ url: targetUrl, hd: '1' }).toString(),
-    signal: AbortSignal.timeout(15_000),
+    body: new URLSearchParams({ url: targetUrl, hd: '0' }).toString(),
+    signal: AbortSignal.timeout(12_000),
   });
 
   if (!res.ok) {
@@ -110,7 +110,7 @@ async function resolveViaTikwmPost(targetUrl, fetchImpl) {
 }
 
 async function resolveViaTikwmGet(targetUrl, fetchImpl) {
-  const apiUrl = `${TIKWM_ORIGIN}/api/?url=${encodeURIComponent(targetUrl)}&hd=1`;
+  const apiUrl = `${TIKWM_ORIGIN}/api/?url=${encodeURIComponent(targetUrl)}&hd=0`;
   const res = await fetchImpl(apiUrl, {
     method: 'GET',
     headers: {
@@ -291,32 +291,43 @@ export async function downloadTikTokVideoBuffer(
     throw new Error('No se proporcionó un enlace de TikTok válido.');
   }
 
-  const expandedUrl = await expandTikTokUrl(cleanUrl, fetchImpl);
-  const candidateUrls =
-    expandedUrl && expandedUrl !== cleanUrl ? [expandedUrl, cleanUrl] : [cleanUrl];
-
-  const resolvers = [
-    resolveViaTikwmPost,
-    resolveViaTikwmGet,
-    resolveViaTikMate,
-    resolveViaWebPage,
-  ];
-
+  // Probamos primero la URL directa con TikWM (acepta vm.tiktok.com / vt.tiktok.com sin viaje extra);
+  // solo expandimos el redirect si el primer intento falla.
   let resolved = null;
   let lastError = null;
 
-  outer: for (const candidate of candidateUrls) {
-    for (const resolver of resolvers) {
-      try {
-        resolved = await resolver(candidate, fetchImpl);
-        if (resolved?.videoUrl) {
-          break outer;
+  try {
+    resolved = await resolveViaTikwmPost(cleanUrl, fetchImpl);
+  } catch (err) {
+    if (err?.isSlideshow) throw err;
+    lastError = err;
+  }
+
+  if (!resolved?.videoUrl) {
+    const expandedUrl = await expandTikTokUrl(cleanUrl, fetchImpl);
+    const candidateUrls =
+      expandedUrl && expandedUrl !== cleanUrl ? [expandedUrl, cleanUrl] : [cleanUrl];
+
+    const resolvers = [
+      resolveViaTikwmPost,
+      resolveViaTikwmGet,
+      resolveViaTikMate,
+      resolveViaWebPage,
+    ];
+
+    outer: for (const candidate of candidateUrls) {
+      for (const resolver of resolvers) {
+        try {
+          resolved = await resolver(candidate, fetchImpl);
+          if (resolved?.videoUrl) {
+            break outer;
+          }
+        } catch (err) {
+          if (err?.isSlideshow) {
+            throw err;
+          }
+          lastError = err;
         }
-      } catch (err) {
-        if (err?.isSlideshow) {
-          throw err;
-        }
-        lastError = err;
       }
     }
   }

@@ -398,6 +398,19 @@ async function resolveViaHtmlAndEmbed(targetUrl, fetchImpl) {
       (initial.text ? extractPinId(unescapePinterestHtml(initial.text)) : null);
   }
 
+  // Atajo rápido: si la primera respuesta HTML ya contiene MP4 directo, evitamos consultar canonical/embed extra
+  if (initial.text) {
+    const quickParsed = extractPinterestVideoCandidatesFromHtml([initial.text], pinId);
+    if (quickParsed.mp4Urls.length > 0) {
+      return {
+        mp4Urls: quickParsed.mp4Urls,
+        title: quickParsed.title,
+        author: quickParsed.author,
+        provider: 'pinterest-html',
+      };
+    }
+  }
+
   const htmlSources = [];
   if (initial.text) htmlSources.push(initial.text);
 
