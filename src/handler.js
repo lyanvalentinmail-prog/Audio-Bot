@@ -1,6 +1,7 @@
 import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 import { buildStickerExif, readWebpExif } from './exif.js';
 import { convertVideoBufferToSoundSticker } from './media.js';
+import { downloadPinterestVideoBuffer, extractPinterestUrl } from './pinterest.js';
 import { loadSettings } from './settings.js';
 import {
   downloadSoundFromSticker,
@@ -63,9 +64,9 @@ function extractMessageText(msg) {
 
 /**
  * Extrae el texto del mensaje y comprueba si invoca:
- * - `.s2` (crear sticker con audio desde video adjunto/citado o desde un enlace de TikTok, o ver el sonido si responde a un sticker)
+ * - `.s2` (crear sticker con audio desde video adjunto/citado o desde un enlace de TikTok / Pinterest, o ver el sonido si responde a un sticker)
  *   - `.s2 full` / `.s2 completo` para eliminar bordes negros y mantener el video completo con margen transparente
- *   - `.s2 <enlace de TikTok>` (o responder `.s2` a un mensaje con enlace de TikTok) para descargarlo y hacerlo sticker con audio
+ *   - `.s2 <enlace de TikTok o Pinterest>` (o responder `.s2` a un mensaje con enlace) para descargarlo y hacerlo sticker con audio
  *   - `.s2 ver` / `.s2 audio` para además adjuntar vista previa reproducible del sonido
  * - `.audio` / `.sonido` / `.veraudio` (ver la onda de sonido, metadatos y escuchar el audio de un sticker)
  */
@@ -100,9 +101,13 @@ export function parseCommandRequest(
   }
 
   const restRaw = parts.slice(1).join(' ');
-  // Quitamos la URL de TikTok antes de evaluar palabras clave para que palabras en el link no activen flags por accidente
+  // Quitamos las URLs de TikTok/Pinterest antes de evaluar palabras clave para que palabras en el link no activen flags por accidente
   const directTikTokUrl = extractTikTokUrl(restRaw);
-  const flagsText = restRaw.replace(directTikTokUrl || '', ' ').toLowerCase();
+  const directPinterestUrl = directTikTokUrl ? null : extractPinterestUrl(restRaw);
+  const flagsText = restRaw
+    .replace(directTikTokUrl || '', ' ')
+    .replace(directPinterestUrl || '', ' ')
+    .toLowerCase();
 
   const fit = /\b(full|completo|entero|contain)\b/.test(flagsText) ? 'full' : 'crop';
   const showSoundPreview = /\b(ver|audio|sonido|onda)\b/.test(flagsText);
@@ -115,7 +120,9 @@ export function parseCommandRequest(
 
   const quoted = unwrapMessage(contextInfo?.quotedMessage);
   const quotedSticker = quoted?.stickerMessage || null;
-  const quotedTikTokUrl = extractTikTokUrl(extractMessageText(quoted));
+  const quotedText = extractMessageText(quoted);
+  const quotedTikTokUrl = extractTikTokUrl(quotedText);
+  const quotedPinterestUrl = quotedTikTokUrl ? null : extractPinterestUrl(quotedText);
 
   // Comando dedicado a ver/extraer el sonido de un sticker (.audio / .sonido / .veraudio)
   if (isInspectCmd) {
@@ -125,6 +132,7 @@ export function parseCommandRequest(
       mediaNode: quotedSticker || msg.stickerMessage || null,
       mediaKind: quotedSticker || msg.stickerMessage ? 'sticker' : null,
       tiktokUrl: null,
+      pinterestUrl: null,
       fit,
       showSoundPreview: true,
     };
@@ -138,6 +146,21 @@ export function parseCommandRequest(
       mediaNode: null,
       mediaKind: 'tiktok',
       tiktokUrl: directTikTokUrl,
+      pinterestUrl: null,
+      fit,
+      showSoundPreview,
+    };
+  }
+
+  // 1b) Enlace de Pinterest pasado directamente junto al comando: `.s2 https://pin.it/...` o `https://pinterest.com/pin/...`
+  if (directPinterestUrl) {
+    return {
+      hasCommand: true,
+      action: 'create_sticker',
+      mediaNode: null,
+      mediaKind: 'pinterest',
+      tiktokUrl: null,
+      pinterestUrl: directPinterestUrl,
       fit,
       showSoundPreview,
     };
@@ -151,6 +174,7 @@ export function parseCommandRequest(
       mediaNode: msg.videoMessage,
       mediaKind: 'video',
       tiktokUrl: null,
+      pinterestUrl: null,
       fit,
       showSoundPreview,
     };
@@ -164,6 +188,7 @@ export function parseCommandRequest(
       mediaNode: msg.documentMessage,
       mediaKind: 'document',
       tiktokUrl: null,
+      pinterestUrl: null,
       fit,
       showSoundPreview,
     };
@@ -177,6 +202,7 @@ export function parseCommandRequest(
       mediaNode: quoted.videoMessage,
       mediaKind: 'video',
       tiktokUrl: null,
+      pinterestUrl: null,
       fit,
       showSoundPreview,
     };
@@ -188,12 +214,13 @@ export function parseCommandRequest(
       mediaNode: quoted.documentMessage,
       mediaKind: 'document',
       tiktokUrl: null,
+      pinterestUrl: null,
       fit,
       showSoundPreview,
     };
   }
 
-  // 5) Respuesta (reply) con `.s2` a un mensaje que contiene un enlace de TikTok
+  // 5) Respuesta (reply) con `.s2` a un mensaje que contiene un enlace de TikTok o Pinterest
   if (quotedTikTokUrl) {
     return {
       hasCommand: true,
@@ -201,6 +228,19 @@ export function parseCommandRequest(
       mediaNode: null,
       mediaKind: 'tiktok',
       tiktokUrl: quotedTikTokUrl,
+      pinterestUrl: null,
+      fit,
+      showSoundPreview,
+    };
+  }
+  if (quotedPinterestUrl) {
+    return {
+      hasCommand: true,
+      action: 'create_sticker',
+      mediaNode: null,
+      mediaKind: 'pinterest',
+      tiktokUrl: null,
+      pinterestUrl: quotedPinterestUrl,
       fit,
       showSoundPreview,
     };
@@ -214,18 +254,20 @@ export function parseCommandRequest(
       mediaNode: quotedSticker,
       mediaKind: 'sticker',
       tiktokUrl: null,
+      pinterestUrl: null,
       fit,
-      showSoundPreview: true,
+      showSoundPreview,
     };
   }
 
-  // El usuario escribió `.s2` pero no adjuntó ni citó un video, enlace de TikTok ni sticker
+  // El usuario escribió `.s2` pero no adjuntó ni citó un video, enlace de TikTok/Pinterest ni sticker
   return {
     hasCommand: true,
     action: 'create_sticker',
     mediaNode: null,
     mediaKind: null,
     tiktokUrl: null,
+    pinterestUrl: null,
     fit,
     showSoundPreview,
   };
@@ -409,7 +451,7 @@ export class CommandQueue {
       return;
     }
 
-    if (!parsedRequest.mediaNode && !parsedRequest.tiktokUrl) {
+    if (!parsedRequest.mediaNode && !parsedRequest.tiktokUrl && !parsedRequest.pinterestUrl) {
       await sock.sendMessage(
         chatJid,
         {
@@ -417,7 +459,8 @@ export class CommandQueue {
             `🎬 *Uso del comando ${cmdLabel}*\n\n` +
             `• Envía un *video* con el texto *${cmdLabel}* en el comentario\n` +
             `• Responde a un *video* escribiendo *${cmdLabel}*\n` +
-            `• Pega un enlace de *TikTok*: *${cmdLabel} https://vm.tiktok.com/...*\n\n` +
+            `• Pega un enlace de *TikTok*: *${cmdLabel} https://vm.tiktok.com/...*\n` +
+            `• Pega un enlace de *Pinterest*: *${cmdLabel} https://pin.it/...*\n\n` +
             `🔊 *Ver sonido de un sticker:*\n` +
             `• Toca el botón *🔊* en la esquina del sticker en WhatsApp, o\n` +
             `• Responde al sticker con *${audioCmdLabel}* (o *${liveSettings.prefix}sonido*) para ver su onda y escuchar el audio aparte.\n\n` +
@@ -430,15 +473,23 @@ export class CommandQueue {
 
     const msgId = message.key?.id || `msg_${Date.now()}`;
     const isTikTok = parsedRequest.mediaKind === 'tiktok' && Boolean(parsedRequest.tiktokUrl);
-    console.log(
-      `[${cmdLabel}] Procesando ${isTikTok ? `TikTok (${parsedRequest.tiktokUrl})` : `video (${msgId})`} de ${chatJid}...`
-    );
+    const isPinterest =
+      parsedRequest.mediaKind === 'pinterest' && Boolean(parsedRequest.pinterestUrl);
+    const sourceLabel = isTikTok
+      ? `TikTok (${parsedRequest.tiktokUrl})`
+      : isPinterest
+      ? `Pinterest (${parsedRequest.pinterestUrl})`
+      : `video (${msgId})`;
+    console.log(`[${cmdLabel}] Procesando ${sourceLabel} de ${chatJid}...`);
     await safeReact(sock, message, '⏳');
 
     try {
       let videoBuffer;
       if (isTikTok) {
         const downloaded = await downloadTikTokVideoBuffer(parsedRequest.tiktokUrl);
+        videoBuffer = downloaded.buffer;
+      } else if (isPinterest) {
+        const downloaded = await downloadPinterestVideoBuffer(parsedRequest.pinterestUrl);
         videoBuffer = downloaded.buffer;
       } else {
         videoBuffer = await downloadMediaToBuffer(
@@ -476,18 +527,24 @@ export class CommandQueue {
 
       await safeReact(sock, message, '✅');
       this.onEvent?.('command_executed', { command: cmdLabel });
+      const originTag = isTikTok ? 'tiktok' : isPinterest ? 'pinterest' : 'video';
       console.log(
-        `[${cmdLabel}] Sticker enviado (${sent.messageId}) | origen=${isTikTok ? 'tiktok' : 'video'} | fit=${parsedRequest.fit} | audio=${sent.withAudio ? 'sí' : 'sin pista de audio'} | webp=${Math.round(converted.webpBuffer.length / 1024)}KB`
+        `[${cmdLabel}] Sticker enviado (${sent.messageId}) | origen=${originTag} | fit=${parsedRequest.fit} | audio=${sent.withAudio ? 'sí' : 'sin pista de audio'} | webp=${Math.round(converted.webpBuffer.length / 1024)}KB`
       );
     } catch (err) {
       this.onEvent?.('handler_error', { error: err?.message || String(err) });
       console.error(`[${cmdLabel}] Error en ${msgId}:`, err?.message || err);
       await safeReact(sock, message, '❌');
+      const errorSubject = isTikTok
+        ? 'el enlace de TikTok'
+        : isPinterest
+        ? 'el enlace de Pinterest'
+        : 'el video';
       try {
         await sock.sendMessage(
           chatJid,
           {
-            text: `❌ No se pudo convertir ${isTikTok ? 'el enlace de TikTok' : 'el video'} a sticker con audio:\n${err?.message || 'Error desconocido'}`,
+            text: `❌ No se pudo convertir ${errorSubject} a sticker con audio:\n${err?.message || 'Error desconocido'}`,
           },
           { quoted: message }
         );
