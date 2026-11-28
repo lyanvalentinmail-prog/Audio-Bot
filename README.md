@@ -1,6 +1,6 @@
 # 🔊 Audio-Bot — Stickers con Audio en WhatsApp (Panel Termux + Baileys)
 
-Bot de WhatsApp en **Node.js** con **panel de control interactivo de terminal (estilo DenjiBot)** pensado para **Termux (Android)** y Linux. Se vincula mediante **Código de 8 dígitos (Pairing Code)** o **Código QR**, convierte videos o enlaces de **TikTok** en **Stickers con Audio** nativos usando **`.s2`**, e incluye un menú de **Ajustes** en vivo con control de permisos (**Solo el dueño**, **Excluidos**, dueños, metadatos y más).
+Bot de WhatsApp en **Node.js** con **panel de control interactivo de terminal (estilo DenjiBot)** pensado para **Termux (Android)** y Linux. Se vincula mediante **Código de 8 dígitos (Pairing Code)** o **Código QR**, convierte videos o enlaces de **TikTok** y **Pinterest** en **Stickers con Audio** nativos usando **`.s2`**, e incluye un menú de **Ajustes** en vivo con control de permisos (**Solo el dueño**, **Excluidos**, dueños, metadatos y más).
 
 ---
 
@@ -18,7 +18,7 @@ Bot de WhatsApp en **Node.js** con **panel de control interactivo de terminal (e
      - **Dueños**: añade números adicionales con permiso total.
      - Prefijo (`.`), descripción (`Made by`), autor (`@Lyan`), segundos máximos y modo de logs.
   7. **Eliminar datos** — limpieza selectiva de caché, ajustes o restablecimiento completo.
-- 🎬 **Comando `.s2`**: convierte videos cortos y enlaces de **TikTok** en **stickers animados con sonido visible** (`Message.stickerMessage` + `StickerMessage.audioMessage` campo `26`, `waveform` de 64 barras y `emojis: ["🔊"]`).
+- 🎬 **Comando `.s2`**: convierte videos cortos y enlaces de **TikTok** o **Pinterest** (`pin.it/...`, `pinterest.com/pin/...`) en **stickers animados con sonido visible** (`Message.stickerMessage` + `StickerMessage.audioMessage` campo `26`, `waveform` de 64 barras y `emojis: ["🔊"]`).
 - ✂️ **`.s2 full` sin bordes negros**: recorta automáticamente las barras negras incrustadas (`cropdetect`) y preserva transparencia real RGBA (`0x00000000`).
 - 🔊 **Ver y extraer el sonido del sticker (`.audio` / `.sonido`)**: responde a cualquier sticker con `.audio`, `.sonido` o `.s2` para ver su onda gráfica, duración, descripción/autor y escuchar su pista de audio.
 
@@ -63,6 +63,7 @@ npm start
 | **Enviar video directo** | Adjunta un video y escribe **`.s2`** en el comentario (caption). |
 | **Responder a un video** | Responde (*reply*) a cualquier video del chat escribiendo **`.s2`**. |
 | **Enlace de TikTok a sticker con audio** | Escribe **`.s2 https://vm.tiktok.com/...`** (o responde `.s2` a un mensaje con link de TikTok). |
+| **Enlace de Pinterest a sticker con audio** | Escribe **`.s2 https://pin.it/...`** o **`https://pinterest.com/pin/...`** (o responde `.s2` a un mensaje con link de Pinterest). |
 | **Completo y sin bordes negros** | Usa **`.s2 full`** (o `.s2 completo`) para eliminar barras negras y conservar el encuadre completo transparente. |
 | **Enviar con nota de audio visible** | Usa **`.s2 ver`** para recibir el sticker con sonido + su nota de audio con onda aparte. |
 | **Ver el sonido de un sticker** | Responde a cualquier sticker con **`.audio`**, **`.sonido`** o **`.s2`**. |

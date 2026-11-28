@@ -9,6 +9,13 @@ import { getMediaKeys, proto } from '@whiskeysockets/baileys';
 import { config } from '../src/config.js';
 import { buildStickerExif, injectWebpExif, inspectWebp, readWebpExif } from '../src/exif.js';
 import { buildVideoFilter, parseCropdetectOutput, waveformFromPcm } from '../src/media.js';
+import {
+  downloadPinterestVideoBuffer,
+  extractPinId,
+  extractPinterestUrl,
+  extractPinterestVideoCandidatesFromHtml,
+  getHlsToMp4Candidates,
+} from '../src/pinterest.js';
 import { downloadTikTokVideoBuffer, extractTikTokUrl } from '../src/tiktok.js';
 import { evaluateSenderAccess, loadSettings, saveSettings } from '../src/settings.js';
 import { fit as tuiFit, pad as tuiPad, width as tuiWidth } from '../src/panel/tui.js';
@@ -285,6 +292,44 @@ test('Handler: detecta .s2 para crear stickers y .audio / .sonido / .s2 sobre st
   );
   assert.equal(tiktokQuotedFull.fit, 'full');
 
+  // Enlace de Pinterest directo: .s2 https://pin.it/4abcXYZ12
+  const pinterestDirect = parseCommandRequest(
+    { conversation: '.s2 https://pin.it/4abcXYZ12' },
+    '.s2',
+    '.audio'
+  );
+  assert.ok(pinterestDirect);
+  assert.equal(pinterestDirect.action, 'create_sticker');
+  assert.equal(pinterestDirect.mediaKind, 'pinterest');
+  assert.equal(pinterestDirect.pinterestUrl, 'https://pin.it/4abcXYZ12');
+  assert.equal(pinterestDirect.fit, 'crop');
+
+  // Enlace de Pinterest citado con .s2 full ver
+  const pinterestQuotedFull = parseCommandRequest(
+    {
+      extendedTextMessage: {
+        text: '.s2 full ver',
+        contextInfo: {
+          quotedMessage: {
+            conversation:
+              'Qué buen clip https://es.pinterest.com/pin/video-divertido--987654321012345678/.',
+          },
+        },
+      },
+    },
+    '.s2',
+    '.audio'
+  );
+  assert.ok(pinterestQuotedFull);
+  assert.equal(pinterestQuotedFull.action, 'create_sticker');
+  assert.equal(pinterestQuotedFull.mediaKind, 'pinterest');
+  assert.equal(
+    pinterestQuotedFull.pinterestUrl,
+    'https://es.pinterest.com/pin/video-divertido--987654321012345678/'
+  );
+  assert.equal(pinterestQuotedFull.fit, 'full');
+  assert.equal(pinterestQuotedFull.showSoundPreview, true);
+
   // Responder .audio o .sonido a un sticker -> inspect_sound
   const inspectAudio = parseCommandRequest(
     {
@@ -510,4 +555,117 @@ test('Ajustes y TUI: modo "Solo el dueño" y números "Excluidos" funcionan en c
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('Pinterest: extrae URLs (pin.it y pinterest.*), convierte HLS y descarga videos MP4 o rechaza imágenes', async () => {
+  assert.equal(
+    extractPinterestUrl('.s2 https://pin.it/5AbCdEfG!'),
+    'https://pin.it/5AbCdEfG'
+  );
+  assert.equal(
+    extractPinterestUrl('mira https://mx.pinterest.com/pin/meme-audio--112233445566778899/'),
+    'https://mx.pinterest.com/pin/meme-audio--112233445566778899/'
+  );
+  assert.equal(
+    extractPinId('https://mx.pinterest.com/pin/meme-audio--112233445566778899/'),
+    '112233445566778899'
+  );
+  assert.equal(extractPinterestUrl('texto normal sin link'), null);
+
+  const hlsCandidates = getHlsToMp4Candidates(
+    'https://v1.pinimg.com/videos/mc/hls/aa/bb/cc/aabbccdd.m3u8'
+  );
+  assert.ok(hlsCandidates.includes('https://v1.pinimg.com/videos/mc/720p/aa/bb/cc/aabbccdd.mp4'));
+  assert.ok(hlsCandidates.includes('https://v1.pinimg.com/videos/mc/expMp4/aa/bb/cc/aabbccdd.mp4'));
+
+  // Extracción desde HTML Relay/PWS escapado con video_list
+  const samplePinHtml = `
+    <html><head>
+      <script id="__PWS_DATA__" type="application/json">
+        {"props":{"initialReduxState":{"pins":{"112233445566778899":{
+          "id":"112233445566778899",
+          "title":"Clip musical",
+          "pinner":{"username":"lyan_pin"},
+          "videos":{"video_list":{
+            "V_720P":{"url":"https:\\u002F\\u002Fv1.pinimg.com\\u002Fvideos\\u002Fmc\\u002F720p\\u002F12\\u002F34\\u002Fclip720.mp4"},
+            "V_HLSV4":{"url":"https:\\u002F\\u002Fv1.pinimg.com\\u002Fvideos\\u002Fmc\\u002Fhls\\u002F12\\u002F34\\u002Fclip720.m3u8"}
+          }}
+        }}}}}
+      </script>
+    </head></html>
+  `;
+  const extracted = extractPinterestVideoCandidatesFromHtml(samplePinHtml, '112233445566778899');
+  assert.equal(
+    extracted.mp4Urls[0],
+    'https://v1.pinimg.com/videos/mc/720p/12/34/clip720.mp4'
+  );
+  assert.equal(extracted.title, 'Clip musical');
+  assert.equal(extracted.author, 'lyan_pin');
+  assert.equal(extracted.isImageOnly, false);
+
+  // Descarga completa desde enlace corto pin.it simulado
+  const fakeMp4 = Buffer.alloc(4096, 0x22);
+  const mockFetch = async (url) => {
+    const u = String(url);
+    if (u.includes('pin.it/5AbCdEfG')) {
+      return {
+        ok: true,
+        status: 200,
+        url: 'https://www.pinterest.com/pin/112233445566778899/',
+        async text() {
+          return samplePinHtml;
+        },
+      };
+    }
+    if (u.includes('assets.pinterest.com/ext/embed.html')) {
+      return { ok: false, status: 404, url: u, async text() { return ''; } };
+    }
+    if (u.includes('v1.pinimg.com/videos/mc/720p/12/34/clip720.mp4')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map([
+          ['content-type', 'video/mp4'],
+          ['content-length', String(fakeMp4.length)],
+        ]),
+        async arrayBuffer() {
+          return fakeMp4.buffer.slice(fakeMp4.byteOffset, fakeMp4.byteOffset + fakeMp4.byteLength);
+        },
+      };
+    }
+    throw new Error(`URL inesperada en mock Pinterest: ${u}`);
+  };
+
+  const downloaded = await downloadPinterestVideoBuffer('https://pin.it/5AbCdEfG', {
+    fetchImpl: mockFetch,
+  });
+  assert.equal(downloaded.buffer.length, 4096);
+  assert.equal(downloaded.provider, 'pinterest-html');
+  assert.equal(downloaded.author, 'lyan_pin');
+
+  // Si el Pin es solo una imagen estática, lanza un mensaje claro indicando que no es un video
+  const imageOnlyHtml = `
+    <html><head>
+      <script id="__PWS_DATA__" type="application/json">
+        {"props":{"initialReduxState":{"pins":{"999999":{
+          "id":"999999",
+          "images":{"orig":{"url":"https://i.pinimg.com/originals/aa/bb/cc.jpg"}}
+        }}}}}
+      </script>
+    </head></html>
+  `;
+  await assert.rejects(
+    () =>
+      downloadPinterestVideoBuffer('https://www.pinterest.com/pin/999999/', {
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          url: 'https://www.pinterest.com/pin/999999/',
+          async text() {
+            return imageOnlyHtml;
+          },
+        }),
+      }),
+    /imagen estática/i
+  );
 });
